@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - Auto-panel switching: Orchestration expands on fan-out, Evaluator on awaiting-approval, Accepted on accept
 - Status badge in Orchestration accordion header shows current state (idle/fan-out/evaluating/awaiting-approval/accepted)
 - Visual score cards with color-coded progress bars per dimension (Accuracy, Completeness, Clarity, Relevance), winner glow highlight, sorted by total score
+- Redesigned Settings page — two-column layout with icon headers, PrimeVue Tabs for per-agent prompt overrides, model badges, inherit hint indicator
 - "New Chat" button in top navigation bar — resets state, clears prompt, and focuses input
 - Accepted response panel in right pane — renders winning agent's full response as markdown with copy-to-clipboard
 - Evaluator review panel shows winner's full response prominently with collapsible reasoning and agent comparison
