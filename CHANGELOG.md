@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `AgenticWorkflow.Agent.Sonnet`: adds Spectre.Console CLI prompt for user name on startup using `AnsiConsole.Ask`.
+- `AgenticWorkflow.Agent.Gpt54`: adds a `--cli` mode with a Spectre.Console name prompt, greeting output, and `--name` fallback for non-interactive runs.
+
+### Added
+
+- Add new `AgenticWorkflow.Cli` console project using `Spectre.Console`.
+- Prompt for user name with validation and render a formatted greeting.
+
+### Fixed
+
+- Stream fan-out now calls agent SSE endpoint (`/api/run-stream`) and forwards token deltas to the frontend as `agent_token` events.
+- Frontend chat now consumes `agent_token` events and incrementally updates the same message bubble during generation.
+- Gateway SSE parser now honors the agent `done` marker to end stream consumption deterministically.
+- Inline question "Submit Answer" now shows immediate loading feedback and disables controls while the request is in flight.
+- Canceling a follow-up question now skips only that clarification and continues to evaluation with current agent responses instead of stopping the whole chat.
+- Accepted Response panel now supports expand/collapse to full-width view for easier reading.
+- Added a draggable divider between chat and right pane so either side can be resized live.
+- Failed agents are now excluded from chat response bubbles and consistently shown as red in orchestration status.
+- Gateway agent call timeout reduced to fail faster when one model is unresponsive.
+
 ## 2026-03-28
 
 ### Fixed

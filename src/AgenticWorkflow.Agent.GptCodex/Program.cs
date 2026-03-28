@@ -11,13 +11,10 @@ var agentName = builder.Configuration["Agent:Name"] ?? "Agent-GptCodex";
 var modelName = builder.Configuration["Agent:Model"] ?? "gpt-5.3-codex";
 var defaultSystemPrompt = builder.Configuration["Agent:SystemPrompt"] ?? "You are a helpful assistant.";
 
-// Register singleton CopilotClient — AutoStart is true by default
 builder.Services.AddSingleton<CopilotClient>(_ => new CopilotClient());
 
 var app = builder.Build();
 app.MapDefaultEndpoints();
-
-// ── Non-streaming endpoint (used by Gateway fan-out) ─────────────────
 
 app.MapPost("/api/run", async (
     AgentRequest request,
@@ -65,7 +62,6 @@ app.MapPost("/api/run", async (
 
         await session.SendAsync(new MessageOptions { Prompt = request.Prompt });
 
-        // Link request cancellation + 5-min hard timeout
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromMinutes(5));
         await using (cts.Token.Register(() => done.TrySetCanceled()))
@@ -134,8 +130,6 @@ app.MapPost("/api/run", async (
     }
 });
 
-// ── Streaming endpoint (SSE) ─────────────────────────────────────────
-
 app.MapGet("/api/run-stream", async (
     string prompt,
     string? systemPrompt,
@@ -192,13 +186,12 @@ app.MapGet("/api/run-stream", async (
 
         await session.SendAsync(new MessageOptions { Prompt = prompt });
 
-        // Link client disconnect + 5-min hard timeout
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromMinutes(5));
         await using (cts.Token.Register(() => done.TrySetCanceled()))
         {
             try { await done.Task; }
-            catch (TaskCanceledException) { /* timeout or client disconnect — fall through */ }
+            catch (TaskCanceledException) { }
         }
 
         sw.Stop();
@@ -210,7 +203,7 @@ app.MapGet("/api/run-stream", async (
         sw.Stop();
         logger.LogError(ex, "{AgentName} streaming failed", agentName);
         var errorData = JsonSerializer.Serialize(new { error = ex.Message, agent = agentName });
-        try { await WriteSSE(httpContext, errorData, sseLock); } catch { /* client disconnected */ }
+        try { await WriteSSE(httpContext, errorData, sseLock); } catch { }
     }
 });
 
@@ -224,7 +217,7 @@ static async Task WriteSSE(HttpContext ctx, string data, SemaphoreSlim sseLock)
         await ctx.Response.WriteAsync($"data: {data}\n\n");
         await ctx.Response.Body.FlushAsync();
     }
-    catch { /* client disconnected — swallow */ }
+    catch { }
     finally
     {
         sseLock.Release();

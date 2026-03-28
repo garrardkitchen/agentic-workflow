@@ -3,6 +3,23 @@ using System.Text;
 using System.Text.Json;
 using AgenticWorkflow.Shared.Models;
 using GitHub.Copilot.SDK;
+using Spectre.Console;
+
+if (args.Contains("--cli", StringComparer.OrdinalIgnoreCase))
+{
+    try
+    {
+        RunCli(args);
+        return;
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]{Markup.Escape(ex.Message)}[/]");
+        Environment.ExitCode = 1;
+    }
+
+    return;
+}
 
 var builder = WebApplication.CreateBuilder(args);
 builder.AddServiceDefaults();
@@ -215,6 +232,45 @@ app.MapGet("/api/run-stream", async (
 });
 
 app.Run();
+
+static void RunCli(string[] arguments)
+{
+    AnsiConsole.MarkupLine("[bold green]Agentic Workflow CLI[/]");
+
+    var providedName = GetArgumentValue(arguments, "--name");
+    var name = !string.IsNullOrWhiteSpace(providedName)
+        ? providedName
+        : PromptForName();
+
+    AnsiConsole.MarkupLine($"Hello, [bold cyan]{Markup.Escape(name.Trim())}[/]!");
+}
+
+static string PromptForName()
+{
+    if (Console.IsInputRedirected || Console.IsOutputRedirected)
+    {
+        throw new InvalidOperationException("Interactive prompting requires a terminal. Re-run with --cli --name <value> or use an interactive shell.");
+    }
+
+    return AnsiConsole.Prompt(
+        new TextPrompt<string>("What is your [cyan]name[/]?")
+            .PromptStyle("green")
+            .ValidationErrorMessage("[red]Please enter a name.[/]")
+            .Validate(input => !string.IsNullOrWhiteSpace(input)));
+}
+
+static string? GetArgumentValue(string[] arguments, string argumentName)
+{
+    for (var i = 0; i < arguments.Length - 1; i++)
+    {
+        if (string.Equals(arguments[i], argumentName, StringComparison.OrdinalIgnoreCase))
+        {
+            return arguments[i + 1];
+        }
+    }
+
+    return null;
+}
 
 static async Task WriteSSE(HttpContext ctx, string data, SemaphoreSlim sseLock)
 {

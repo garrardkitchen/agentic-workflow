@@ -134,17 +134,66 @@ export function useOrchestrator() {
         if (event.agentResult) {
           const agent = agents.find(a => a.name === event.agentResult!.agentName)
           if (agent) {
-            agent.status = 'complete'
+            agent.status = event.agentResult.failed ? 'failed' : 'complete'
             agent.elapsedMs = event.agentResult.elapsedMs
           }
-          currentSession.value?.agentResults.push(event.agentResult)
-          currentSession.value?.chatHistory.push({
-            role: 'agent',
-            messageId: event.messageId,
-            content: event.agentResult.responseText,
-            agentName: event.agentResult.agentName,
-            timestamp: event.timestamp,
-          })
+          if (currentSession.value) {
+            currentSession.value.agentResults.push(event.agentResult)
+            if (event.agentResult.failed) break
+
+            const existing = event.messageId
+              ? currentSession.value.chatHistory.find(
+                m => m.role === 'agent' && m.messageId === event.messageId
+              )
+              : undefined
+
+            if (existing) {
+              existing.content = event.agentResult.responseText
+              existing.agentName = event.agentResult.agentName
+              existing.timestamp = event.timestamp
+            } else {
+              currentSession.value.chatHistory.push({
+                role: 'agent',
+                messageId: event.messageId,
+                content: event.agentResult.responseText,
+                agentName: event.agentResult.agentName,
+                timestamp: event.timestamp,
+              })
+            }
+          }
+        }
+        break
+
+      case 'agent_token':
+        if (!currentSession.value || !event.content) break
+        {
+          const agentName = event.agentName ?? 'agent'
+          const agent = agents.find(a => a.name === agentName)
+          if (agent?.status === 'failed') break
+          const messageId = event.messageId
+
+          let target = messageId
+            ? currentSession.value.chatHistory.find(
+              m => m.role === 'agent' && m.messageId === messageId
+            )
+            : undefined
+
+          if (!target) {
+            target = {
+              role: 'agent',
+              messageId,
+              content: '',
+              agentName,
+              timestamp: event.timestamp,
+            }
+            currentSession.value.chatHistory.push(target)
+          }
+
+          target.content += event.content
+          target.agentName = agentName
+          target.timestamp = event.timestamp
+
+          if (agent) agent.status = 'running'
         }
         break
 
@@ -204,7 +253,16 @@ export function useOrchestrator() {
 
       case 'error':
         if (event.agentName) {
-          const agent = agents.find(a => a.name === event.agentName)
+          const normalizedAgentName = event.agentName.startsWith('agent-')
+            ? event.agentName === 'agent-sonnet'
+              ? 'Agent-Sonnet'
+              : event.agentName === 'agent-codex'
+                ? 'Agent-GptCodex'
+                : event.agentName === 'agent-gpt54'
+                  ? 'Agent-Gpt54'
+                  : event.agentName
+            : event.agentName
+          const agent = agents.find(a => a.name === normalizedAgentName)
           if (agent) agent.status = 'failed'
         }
         break
@@ -213,18 +271,30 @@ export function useOrchestrator() {
 
   async function submitDecision(sessionId: string, decision: 'accept' | 'decline' | 'restart') {
     if (decision === 'decline') {
-      // Persist decline and sync queue/session state
+      // Skip current clarification and keep orchestration alive.
       try {
         const res = await fetch(`/api/sessions/${sessionId}/decide`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ decision: 'decline' }),
         })
-        if (res.ok) currentSession.value = await res.json()
+        if (res.ok) {
+          const updated: SessionState = await res.json()
+          currentSession.value = updated
+          pendingQuestion.value = updated.pendingQuestions?.[0] ?? null
+          orchestratorState.value =
+            updated.status === 'AwaitingInput'
+              ? 'awaiting-input'
+              : updated.status === 'AwaitingApproval'
+                ? 'awaiting-approval'
+                : 'idle'
+
+          if (updated.status === 'AwaitingApproval' && updated.evaluation) {
+            const winnerAgent = agents.find(a => a.name === updated.evaluation!.winner)
+            if (winnerAgent) winnerAgent.status = 'winner'
+          }
+        }
       } catch { /* non-critical */ }
-      pendingQuestion.value = null
-      orchestratorState.value = 'idle'
-      agents.forEach(a => { a.status = 'idle'; a.elapsedMs = undefined })
       return
     }
 
@@ -279,39 +349,54 @@ export function useOrchestrator() {
     questionId: string,
     answerText: string,
     selectedChoices: string[],
-  ) {
-    const response = await fetch(`/api/sessions/${sessionId}/answer`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        questionId,
-        answerText: answerText || null,
-        selectedChoices,
-      }),
-    })
+  ): Promise<boolean> {
+    error.value = null
 
-    if (!response.ok) {
-      throw new Error(`Failed to submit answer: HTTP ${response.status}`)
-    }
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          questionId,
+          answerText: answerText || null,
+          selectedChoices,
+        }),
+      })
 
-    const updated: SessionState = await response.json()
-    currentSession.value = updated
+      if (!response.ok) {
+        let details = ''
+        try {
+          const body = await response.json() as { error?: string }
+          details = body?.error ? ` - ${body.error}` : ''
+        } catch {
+          // Ignore parse failure and fall back to status-only message.
+        }
+        throw new Error(`Failed to submit answer: HTTP ${response.status}${details}`)
+      }
 
-    const remaining = updated.pendingQuestions ?? []
-    pendingQuestion.value = remaining[0] ?? null
-    orchestratorState.value = pendingQuestion.value
-      ? 'awaiting-input'
-      : (updated.status === 'AwaitingApproval' ? 'awaiting-approval' : 'fan-out')
+      const updated: SessionState = await response.json()
+      currentSession.value = updated
 
-    if (pendingQuestion.value) {
-      // More questions remain; do not restart orchestration yet.
-      return
-    }
+      const remaining = updated.pendingQuestions ?? []
+      pendingQuestion.value = remaining[0] ?? null
+      orchestratorState.value = pendingQuestion.value
+        ? 'awaiting-input'
+        : (updated.status === 'AwaitingApproval' ? 'awaiting-approval' : 'fan-out')
 
-    // Backend now continues only the originating agent branch and returns updated state.
-    if (updated.status === 'AwaitingApproval' && updated.evaluation) {
-      const winnerAgent = agents.find(a => a.name === updated.evaluation!.winner)
-      if (winnerAgent) winnerAgent.status = 'winner'
+      if (pendingQuestion.value) {
+        // More questions remain; do not restart orchestration yet.
+        return true
+      }
+
+      // Backend now continues only the originating agent branch and returns updated state.
+      if (updated.status === 'AwaitingApproval' && updated.evaluation) {
+        const winnerAgent = agents.find(a => a.name === updated.evaluation!.winner)
+        if (winnerAgent) winnerAgent.status = 'winner'
+      }
+      return true
+    } catch (e: any) {
+      error.value = e.message ?? 'Failed to submit question answer'
+      return false
     }
   }
 

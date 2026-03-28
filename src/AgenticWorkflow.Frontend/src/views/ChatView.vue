@@ -19,6 +19,7 @@ const {
 
 const promptInput = ref('')
 const promptInputEl = ref<HTMLElement>()
+const chatMainEl = ref<HTMLElement>()
 const chatContainer = ref<HTMLElement>()
 const expandedAgents = ref<Set<string>>(new Set())
 const copySuccess = ref(false)
@@ -26,6 +27,10 @@ const activePanel = ref<string | null>('orchestration')
 const questionAnswerText = ref('')
 const questionChoice = ref('')
 const questionChoices = ref<Set<string>>(new Set())
+const isSubmittingQuestionAnswer = ref(false)
+const isAcceptedResponseExpanded = ref(false)
+const isResizingPanels = ref(false)
+const rightPanelWidth = ref(480)
 
 function isAwaitingQuestionForMessage(messageId?: string) {
   if (orchestratorState.value !== 'awaiting-input' || !messageId) return false
@@ -52,6 +57,10 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('new-conversation', handleNewConversation)
+  window.removeEventListener('mousemove', handleResizeMove)
+  window.removeEventListener('mouseup', stopResizePanels)
+  document.body.style.removeProperty('cursor')
+  document.body.style.removeProperty('user-select')
 })
 
 function handleNewConversation() {
@@ -93,6 +102,7 @@ async function handleSubmit() {
 }
 
 async function handleDecision(d: 'accept' | 'decline' | 'restart') {
+  if (d === 'decline' && isSubmittingQuestionAnswer.value) return
   if (!currentSession.value) return
   await submitDecision(currentSession.value.id, d)
   if (d === 'decline') {
@@ -119,6 +129,7 @@ function toggleQuestionChoice(choice: string) {
 }
 
 async function handleSubmitQuestionAnswer() {
+  if (isSubmittingQuestionAnswer.value) return
   if (!currentSession.value || !pendingQuestion.value) return
   const q = pendingQuestion.value
   if (q.inputType === 'SingleChoice' && !questionChoice.value) return
@@ -133,10 +144,17 @@ async function handleSubmitQuestionAnswer() {
         : []
 
   const answerText = q.inputType === 'FreeText' ? questionAnswerText.value.trim() : ''
-  await submitQuestionAnswer(currentSession.value.id, q.questionId, answerText, selectedChoices)
-  questionAnswerText.value = ''
-  questionChoice.value = ''
-  questionChoices.value = new Set()
+  isSubmittingQuestionAnswer.value = true
+  try {
+    const submitted = await submitQuestionAnswer(currentSession.value.id, q.questionId, answerText, selectedChoices)
+    if (submitted) {
+      questionAnswerText.value = ''
+      questionChoice.value = ''
+      questionChoices.value = new Set()
+    }
+  } finally {
+    isSubmittingQuestionAnswer.value = false
+  }
 }
 
 function handleKeydown(e: KeyboardEvent) {
@@ -172,6 +190,46 @@ function toggleAgentExpand(agentName: string) {
   expandedAgents.value = newSet
 }
 
+function toggleAcceptedResponseExpand() {
+  isAcceptedResponseExpanded.value = !isAcceptedResponseExpanded.value
+}
+
+function startResizePanels(e: MouseEvent) {
+  if (isAcceptedResponseExpanded.value) return
+  e.preventDefault()
+  isResizingPanels.value = true
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+}
+
+function handleResizeMove(e: MouseEvent) {
+  if (!isResizingPanels.value) return
+  const rect = chatMainEl.value?.getBoundingClientRect()
+  if (!rect) return
+
+  const minRight = 320
+  const minLeft = 320
+  const maxRight = Math.max(minRight, rect.width - minLeft)
+  const nextWidth = rect.right - e.clientX
+
+  rightPanelWidth.value = Math.min(maxRight, Math.max(minRight, nextWidth))
+}
+
+function stopResizePanels() {
+  if (!isResizingPanels.value) return
+  isResizingPanels.value = false
+  document.body.style.removeProperty('cursor')
+  document.body.style.removeProperty('user-select')
+}
+
+const rightPanelStyle = computed(() => {
+  if (isAcceptedResponseExpanded.value) return undefined
+  return {
+    width: `${rightPanelWidth.value}px`,
+    minWidth: `${rightPanelWidth.value}px`,
+  }
+})
+
 function truncateText(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text
   return text.slice(0, maxLen) + '…'
@@ -202,6 +260,11 @@ async function copyToClipboard() {
 }
 
 const sidebarOpen = ref(false)
+
+onMounted(() => {
+  window.addEventListener('mousemove', handleResizeMove)
+  window.addEventListener('mouseup', stopResizePanels)
+})
 </script>
 
 <template>
@@ -236,7 +299,7 @@ const sidebarOpen = ref(false)
     </aside>
 
     <!-- Main Content -->
-    <div class="chat-main">
+    <div ref="chatMainEl" :class="['chat-main', { 'accepted-expanded': isAcceptedResponseExpanded }]">
       <!-- Chat Area -->
       <div class="chat-area" ref="chatContainer">
         <div v-if="!currentSession && !isProcessing" class="empty-state">
@@ -269,6 +332,7 @@ const sidebarOpen = ref(false)
                 v-for="choice in pendingQuestion.choices"
                 :key="choice"
                 :class="['choice-chip', { selected: questionChoice === choice }]"
+                :disabled="isSubmittingQuestionAnswer"
                 @click="questionChoice = choice"
               >{{ choice }}</button>
             </div>
@@ -278,6 +342,7 @@ const sidebarOpen = ref(false)
                 v-for="choice in pendingQuestion.choices"
                 :key="choice"
                 :class="['choice-chip', { selected: questionChoices.has(choice) }]"
+                :disabled="isSubmittingQuestionAnswer"
                 @click="toggleQuestionChoice(choice)"
               >{{ choice }}</button>
             </div>
@@ -289,22 +354,25 @@ const sidebarOpen = ref(false)
               autoResize
               class="question-input mono"
               placeholder="Type your answer..."
+              :disabled="isSubmittingQuestionAnswer"
             />
 
             <div class="approval-buttons">
               <Button
-                label="Submit Answer"
+                :label="isSubmittingQuestionAnswer ? 'Submitting...' : 'Submit Answer'"
                 icon="pi pi-check"
                 severity="success"
                 size="small"
                 @click="handleSubmitQuestionAnswer"
+                :loading="isSubmittingQuestionAnswer"
                 :disabled="
+                  isSubmittingQuestionAnswer ||
                   (pendingQuestion.inputType === 'FreeText' && !questionAnswerText.trim()) ||
                   (pendingQuestion.inputType === 'SingleChoice' && !questionChoice) ||
                   (pendingQuestion.inputType === 'MultiChoice' && questionChoices.size === 0)
                 "
               />
-              <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined @click="handleDecision('decline')" />
+              <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined :disabled="isSubmittingQuestionAnswer" @click="handleDecision('decline')" />
             </div>
           </div>
           </template>
@@ -330,6 +398,7 @@ const sidebarOpen = ref(false)
                 v-for="choice in pendingQuestion.choices"
                 :key="choice"
                 :class="['choice-chip', { selected: questionChoice === choice }]"
+                :disabled="isSubmittingQuestionAnswer"
                 @click="questionChoice = choice"
               >{{ choice }}</button>
             </div>
@@ -339,6 +408,7 @@ const sidebarOpen = ref(false)
                 v-for="choice in pendingQuestion.choices"
                 :key="choice"
                 :class="['choice-chip', { selected: questionChoices.has(choice) }]"
+                :disabled="isSubmittingQuestionAnswer"
                 @click="toggleQuestionChoice(choice)"
               >{{ choice }}</button>
             </div>
@@ -350,22 +420,25 @@ const sidebarOpen = ref(false)
               autoResize
               class="question-input mono"
               placeholder="Type your answer..."
+              :disabled="isSubmittingQuestionAnswer"
             />
 
             <div class="approval-buttons">
               <Button
-                label="Submit Answer"
+                :label="isSubmittingQuestionAnswer ? 'Submitting...' : 'Submit Answer'"
                 icon="pi pi-check"
                 severity="success"
                 size="small"
                 @click="handleSubmitQuestionAnswer"
+                :loading="isSubmittingQuestionAnswer"
                 :disabled="
+                  isSubmittingQuestionAnswer ||
                   (pendingQuestion.inputType === 'FreeText' && !questionAnswerText.trim()) ||
                   (pendingQuestion.inputType === 'SingleChoice' && !questionChoice) ||
                   (pendingQuestion.inputType === 'MultiChoice' && questionChoices.size === 0)
                 "
               />
-              <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined @click="handleDecision('decline')" />
+              <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined :disabled="isSubmittingQuestionAnswer" @click="handleDecision('decline')" />
             </div>
           </div>
         </template>
@@ -377,7 +450,9 @@ const sidebarOpen = ref(false)
       </div>
 
       <!-- Right Panel -->
-      <div class="right-panel">
+      <div class="panel-divider" @mousedown="startResizePanels"></div>
+
+      <div class="right-panel" :style="rightPanelStyle">
         <Accordion v-model:value="activePanel" class="right-accordion">
           <!-- Orchestration Panel -->
           <AccordionPanel value="orchestration">
@@ -513,15 +588,26 @@ const sidebarOpen = ref(false)
                   <div class="accepted-label">
                     <span class="accepted-agent">{{ acceptedResponse.agentName }}</span>
                   </div>
-                  <Button
-                    :icon="copySuccess ? 'pi pi-check' : 'pi pi-copy'"
-                    :severity="copySuccess ? 'success' : 'secondary'"
-                    size="small"
-                    text
-                    rounded
-                    @click="copyToClipboard"
-                    v-tooltip.left="'Copy to clipboard'"
-                  />
+                  <div class="accepted-panel-actions">
+                    <Button
+                      :icon="isAcceptedResponseExpanded ? 'pi pi-window-minimize' : 'pi pi-window-maximize'"
+                      severity="secondary"
+                      size="small"
+                      text
+                      rounded
+                      @click="toggleAcceptedResponseExpand"
+                      v-tooltip.left="isAcceptedResponseExpanded ? 'Collapse width' : 'Expand to full width'"
+                    />
+                    <Button
+                      :icon="copySuccess ? 'pi pi-check' : 'pi pi-copy'"
+                      :severity="copySuccess ? 'success' : 'secondary'"
+                      size="small"
+                      text
+                      rounded
+                      @click="copyToClipboard"
+                      v-tooltip.left="'Copy to clipboard'"
+                    />
+                  </div>
                 </div>
                 <div class="accepted-content markdown-body" v-html="acceptedResponseHtml"></div>
               </template>
@@ -662,6 +748,20 @@ const sidebarOpen = ref(false)
   gap: 0;
 }
 
+.chat-main.accepted-expanded .chat-area {
+  display: none;
+}
+
+.chat-main.accepted-expanded .panel-divider {
+  display: none;
+}
+
+.chat-main.accepted-expanded .right-panel {
+  width: 100%;
+  min-width: 0;
+  border-left: none;
+}
+
 .chat-area {
   flex: 1;
   overflow-y: auto;
@@ -691,6 +791,27 @@ const sidebarOpen = ref(false)
   display: flex;
   flex-direction: column;
   gap: 1rem;
+}
+
+.panel-divider {
+  width: 8px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  transition: background 0.2s;
+}
+.panel-divider::before {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 0.75rem;
+  bottom: 0.75rem;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+.panel-divider:hover::before {
+  background: rgba(59, 130, 246, 0.4);
 }
 
 /* Right Panel Accordion — override PrimeVue Aura theme */
@@ -1027,6 +1148,11 @@ const sidebarOpen = ref(false)
   justify-content: space-between;
   margin-bottom: 0.75rem;
 }
+.accepted-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+}
 .accepted-label {
   display: flex;
   align-items: center;
@@ -1204,6 +1330,10 @@ const sidebarOpen = ref(false)
   padding: 0.25rem 0.6rem;
   font-size: 0.75rem;
   cursor: pointer;
+}
+.choice-chip:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 .choice-chip.selected {
   border-color: rgba(139,92,246,0.45);

@@ -251,6 +251,9 @@ agentic-workflow/
     │   ├── Program.cs
     │   └── appsettings.json
     │
+    ├── 📁 AgenticWorkflow.Cli/            # 💬 Spectre.Console demo CLI
+    │   └── Program.cs                     #     Prompts for a name
+    │
     └── 📁 AgenticWorkflow.Frontend/       # 🖥️  Vue 3 + PrimeVue + Vite
         ├── package.json
         ├── vite.config.ts
@@ -303,6 +306,13 @@ The Aspire dashboard opens automatically — typically at `https://localhost:171
 | **Agent-Sonnet** | Claude Sonnet 4.6 agent |
 | **Agent-Codex** | GPT-5.3 Codex agent |
 | **Agent-Gpt54** | GPT-5.4 agent |
+
+### Run the Spectre.Console CLI example
+
+```bash
+cd src/AgenticWorkflow.Cli
+dotnet run
+```
 
 ---
 

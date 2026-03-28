@@ -17,6 +17,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgenticWorkflow.Agent.GptCo
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgenticWorkflow.Agent.Gpt54", "AgenticWorkflow.Agent.Gpt54\AgenticWorkflow.Agent.Gpt54.csproj", "{8870BCA3-2FE8-48BD-8118-3ECB19479404}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgenticWorkflow.Cli", "AgenticWorkflow.Cli\AgenticWorkflow.Cli.csproj", "{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -111,6 +113,18 @@ Global
 		{8870BCA3-2FE8-48BD-8118-3ECB19479404}.Release|x64.Build.0 = Release|Any CPU
 		{8870BCA3-2FE8-48BD-8118-3ECB19479404}.Release|x86.ActiveCfg = Release|Any CPU
 		{8870BCA3-2FE8-48BD-8118-3ECB19479404}.Release|x86.Build.0 = Release|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Debug|x64.Build.0 = Debug|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Debug|x86.Build.0 = Debug|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Release|x64.ActiveCfg = Release|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Release|x64.Build.0 = Release|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Release|x86.ActiveCfg = Release|Any CPU
+		{4FDF88D0-C222-4FCB-BCC9-E2833901B07D}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
