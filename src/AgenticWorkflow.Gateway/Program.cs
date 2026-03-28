@@ -449,7 +449,28 @@ app.MapPost("/api/orchestrate", async (
         Status = SessionStatus.Evaluating
     }, jsonOptions, sseLock);
 
-    var evaluation = await EvaluateResponsesAsync(results, request.Prompt, promptConfig.EvaluatorPrompt, copilotClient, logger);
+    var evaluationCandidates = results.Where(r => !r.Failed).ToArray();
+    if (evaluationCandidates.Length == 0)
+    {
+        session.Status = SessionStatus.Failed;
+        session.ChatHistory.Add(new ChatMessage
+        {
+            Role = "system",
+            Content = "No successful agent responses available for evaluation."
+        });
+        await sessionStore.UpdateAsync(session, ct);
+
+        await SendEvent(httpContext, new StreamEvent
+        {
+            Type = "error",
+            SessionId = sessionId,
+            Content = "No successful agent responses available for evaluation.",
+            Status = SessionStatus.Failed
+        }, jsonOptions, sseLock);
+        return;
+    }
+
+    var evaluation = await EvaluateResponsesAsync(evaluationCandidates, request.Prompt, promptConfig.EvaluatorPrompt, copilotClient, logger);
     session.Evaluation = evaluation;
 
     session.ChatHistory.Add(new ChatMessage
@@ -549,8 +570,21 @@ app.MapPost("/api/sessions/{id}/decide", async (
             {
                 var promptConfig = await promptStore.GetAsync(ct);
                 session.Status = SessionStatus.Evaluating;
+                var evaluationCandidates = session.AgentResults.Where(r => !r.Failed).ToArray();
+                if (evaluationCandidates.Length == 0)
+                {
+                    session.Status = SessionStatus.Failed;
+                    session.ChatHistory.Add(new ChatMessage
+                    {
+                        Role = "system",
+                        Content = "No successful agent responses available for evaluation."
+                    });
+                    await sessionStore.UpdateAsync(session, ct);
+                    return Results.Ok(session);
+                }
+
                 session.Evaluation = await EvaluateResponsesAsync(
-                    [.. session.AgentResults],
+                    evaluationCandidates,
                     session.Prompt,
                     promptConfig.EvaluatorPrompt,
                     copilotClient,
@@ -735,18 +769,31 @@ app.MapPost("/api/sessions/{id}/answer", async (
         {
             var promptConfig = await promptStore.GetAsync(ct);
             session.Status = SessionStatus.Evaluating;
-            session.Evaluation = await EvaluateResponsesAsync(
-                [.. session.AgentResults],
+            var evaluationCandidates = session.AgentResults.Where(r => !r.Failed).ToArray();
+            if (evaluationCandidates.Length == 0)
+            {
+                session.Status = SessionStatus.Failed;
+                session.ChatHistory.Add(new ChatMessage
+                {
+                    Role = "system",
+                    Content = "No successful agent responses available for evaluation."
+                });
+            }
+            else
+            {
+                session.Evaluation = await EvaluateResponsesAsync(
+                evaluationCandidates,
                 session.Prompt,
                 promptConfig.EvaluatorPrompt,
                 copilotClient,
                 logger);
-            session.ChatHistory.Add(new ChatMessage
-            {
-                Role = "evaluator",
-                Content = $"Winner: {session.Evaluation.Winner}\n\n{session.Evaluation.Reasoning}"
-            });
-            session.Status = SessionStatus.AwaitingApproval;
+                session.ChatHistory.Add(new ChatMessage
+                {
+                    Role = "evaluator",
+                    Content = $"Winner: {session.Evaluation.Winner}\n\n{session.Evaluation.Reasoning}"
+                });
+                session.Status = SessionStatus.AwaitingApproval;
+            }
         }
 
         await sessionStore.UpdateAsync(session, ct);
@@ -1158,9 +1205,9 @@ static UserQuestion? TryExtractNaturalLanguageQuestion(string text, string sourc
     // Avoid capturing obvious non-user prompts.
     if (candidate.Length < 8 || candidate.Length > 300) return null;
 
-    // Ask-for-input cues to reduce false positives.
+    // Ask-for-input cues to reduce false positives while allowing common direct asks.
     var asksUser = Regex.IsMatch(candidate,
-        @"\b(would you|do you|can you|could you|please provide|which|what is your|choose|select|tell me)\b",
+        @"\b(would you|do you|can you|could you|please provide|which|what is your|choose|select|tell me|should (?:i|we)|are you|is it)\b",
         RegexOptions.IgnoreCase);
     if (!asksUser) return null;
 

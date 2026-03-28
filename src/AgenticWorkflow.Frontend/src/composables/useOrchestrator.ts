@@ -287,6 +287,8 @@ export function useOrchestrator() {
               ? 'awaiting-input'
               : updated.status === 'AwaitingApproval'
                 ? 'awaiting-approval'
+                : updated.status === 'Failed'
+                  ? 'failed'
                 : 'idle'
 
           if (updated.status === 'AwaitingApproval' && updated.evaluation) {
@@ -381,7 +383,11 @@ export function useOrchestrator() {
       pendingQuestion.value = remaining[0] ?? null
       orchestratorState.value = pendingQuestion.value
         ? 'awaiting-input'
-        : (updated.status === 'AwaitingApproval' ? 'awaiting-approval' : 'fan-out')
+        : updated.status === 'AwaitingApproval'
+          ? 'awaiting-approval'
+          : updated.status === 'Failed'
+            ? 'failed'
+            : 'fan-out'
 
       if (pendingQuestion.value) {
         // More questions remain; do not restart orchestration yet.
@@ -395,6 +401,24 @@ export function useOrchestrator() {
       }
       return true
     } catch (e: any) {
+      if (e?.message?.includes('Question') && e?.message?.includes('not found')) {
+        try {
+          await loadSession(sessionId)
+          if (currentSession.value) {
+            pendingQuestion.value = currentSession.value.pendingQuestions?.[0] ?? null
+            orchestratorState.value =
+              currentSession.value.status === 'AwaitingInput'
+                ? 'awaiting-input'
+                : currentSession.value.status === 'AwaitingApproval'
+                  ? 'awaiting-approval'
+                  : currentSession.value.status === 'Failed'
+                    ? 'failed'
+                    : 'idle'
+          }
+        } catch {
+          // Keep original error if refresh fails.
+        }
+      }
       error.value = e.message ?? 'Failed to submit question answer'
       return false
     }

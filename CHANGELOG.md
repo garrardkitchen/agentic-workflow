@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Stream fan-out now calls agent SSE endpoint (`/api/run-stream`) and forwards token deltas to the frontend as `agent_token` events.
+- Evaluation now always runs on successful agent responses even when other agents fail.
 - Frontend chat now consumes `agent_token` events and incrementally updates the same message bubble during generation.
 - Gateway SSE parser now honors the agent `done` marker to end stream consumption deterministically.
 - Inline question "Submit Answer" now shows immediate loading feedback and disables controls while the request is in flight.
