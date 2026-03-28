@@ -1,15 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
 import type { ChatMessage } from '../types'
+import { renderMarkdown } from '../utils/markdown'
 
 const props = defineProps<{ message: ChatMessage }>()
 
-marked.setOptions({ breaks: true, gfm: true })
-
 const renderedContent = computed(() => {
-  return DOMPurify.sanitize(marked.parse(props.message.content) as string)
+  return renderMarkdown(props.message.content)
 })
 
 function roleColor(role: string) {
@@ -17,6 +14,8 @@ function roleColor(role: string) {
     case 'user': return 'var(--accent-blue)'
     case 'agent': return 'var(--accent-green)'
     case 'evaluator': return 'var(--accent-amber)'
+    case 'question': return 'var(--accent-purple)'
+    case 'answer': return 'var(--accent-blue)'
     case 'system': return 'var(--text-secondary)'
     default: return 'var(--text-primary)'
   }
@@ -27,6 +26,8 @@ function roleIcon(role: string) {
     case 'user': return 'pi pi-user'
     case 'agent': return 'pi pi-android'
     case 'evaluator': return 'pi pi-chart-bar'
+    case 'question': return 'pi pi-question-circle'
+    case 'answer': return 'pi pi-comment'
     case 'system': return 'pi pi-info-circle'
     default: return 'pi pi-circle'
   }
@@ -67,6 +68,16 @@ function roleIcon(role: string) {
   border-color: rgba(245, 158, 11, 0.12);
 }
 
+.chat-bubble.question {
+  background: rgba(139, 92, 246, 0.06);
+  border-color: rgba(139, 92, 246, 0.18);
+}
+
+.chat-bubble.answer {
+  background: rgba(59, 130, 246, 0.06);
+  border-color: rgba(59, 130, 246, 0.18);
+}
+
 .bubble-header {
   display: flex;
   align-items: center;
@@ -99,13 +110,17 @@ function roleIcon(role: string) {
   margin-bottom: 0;
 }
 .bubble-content :deep(pre) {
-  background: rgba(0, 0, 0, 0.3);
+  background: rgba(0, 0, 0, 0.2);
   border-radius: 6px;
   padding: 0.75rem;
   overflow-x: auto;
   margin: 0.5rem 0;
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.8rem;
+}
+.bubble-content :deep(pre code.hljs) {
+  display: block;
+  border-radius: 6px;
 }
 .bubble-content :deep(code) {
   font-family: 'JetBrains Mono', monospace;

@@ -3,12 +3,14 @@ import { ref, onMounted } from 'vue'
 import { useOrchestrator } from '../composables/useOrchestrator'
 import Button from 'primevue/button'
 import Textarea from 'primevue/textarea'
+import Select from 'primevue/select'
 import Tabs from 'primevue/tabs'
 import TabList from 'primevue/tablist'
 import Tab from 'primevue/tab'
 import TabPanels from 'primevue/tabpanels'
 import TabPanel from 'primevue/tabpanel'
 import type { PromptConfig } from '../types'
+import { applyCodeTheme, CODE_THEMES, normalizeCodeTheme } from '../utils/codeTheme'
 
 const { getPromptConfig, savePromptConfig } = useOrchestrator()
 
@@ -16,6 +18,7 @@ const config = ref<PromptConfig>({
   drivingSystemPrompt: '',
   agentPromptOverrides: {},
   evaluatorPrompt: '',
+  codeTheme: 'github-dark',
 })
 const saving = ref(false)
 const saved = ref(false)
@@ -27,6 +30,7 @@ const agents = [
 ]
 
 const activeAgentTab = ref(agents[0].key)
+const codeThemeOptions = CODE_THEMES.map(t => ({ label: t, value: t }))
 
 onMounted(async () => {
   try {
@@ -36,6 +40,8 @@ onMounted(async () => {
         config.value.agentPromptOverrides[a.key] = ''
       }
     }
+    config.value.codeTheme = normalizeCodeTheme(config.value.codeTheme)
+    await applyCodeTheme(config.value.codeTheme)
   } catch (e) {
     console.error('Failed to load config:', e)
   }
@@ -45,6 +51,9 @@ async function handleSave() {
   saving.value = true
   saved.value = false
   try {
+    config.value.codeTheme = normalizeCodeTheme(config.value.codeTheme)
+    localStorage.setItem('codeTheme', config.value.codeTheme)
+    await applyCodeTheme(config.value.codeTheme)
     await savePromptConfig(config.value)
     saved.value = true
     setTimeout(() => { saved.value = false }, 2000)
@@ -115,6 +124,26 @@ async function handleSave() {
             rows="12"
             class="prompt-editor mono"
             autoResize
+          />
+        </section>
+
+        <section class="setting-card glass-card">
+          <div class="card-header">
+            <div class="card-icon-wrap" style="--card-accent: var(--accent-purple)">
+              <i class="pi pi-palette"></i>
+            </div>
+            <div>
+              <h2>Code Block Theme</h2>
+              <p class="setting-desc">Choose syntax highlighting style for markdown/code output.</p>
+            </div>
+          </div>
+          <Select
+            v-model="config.codeTheme"
+            :options="codeThemeOptions"
+            optionLabel="label"
+            optionValue="value"
+            class="theme-select"
+            placeholder="Select theme"
           />
         </section>
       </div>
@@ -271,6 +300,10 @@ async function handleSave() {
 .prompt-editor:focus {
   border-color: var(--accent-blue) !important;
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15) !important;
+}
+
+.theme-select {
+  width: 100%;
 }
 
 /* Agent Tabs — override PrimeVue theme */

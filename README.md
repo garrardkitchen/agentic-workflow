@@ -18,6 +18,7 @@ Built with **.NET 10**, **Aspire 13.2**, **Microsoft Agent Framework**, **GitHub
 | 💾 **Session Persistence** | Every session state transition is saved to disk as JSON with structured logging |
 | 🔭 **Aspire Dashboard** | Distributed tracing, metrics, and health checks across all services out of the box |
 | 🎨 **Dark Glassmorphism UI** | Animated SVG orchestration visualizer with live agent status and winner highlights |
+| 🧩 **Safe Code Highlighting** | Shared markdown renderer with bounded syntax-highlighting work to keep large responses responsive |
 | ✏️ **Editable Prompts** | Driving system prompt, per-agent overrides, and evaluator prompt — all editable in the Settings page |
 
 ---

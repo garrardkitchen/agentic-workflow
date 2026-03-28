@@ -4,6 +4,7 @@ public sealed class PromptConfig
 {
     public string DrivingSystemPrompt { get; set; } = "You are a helpful assistant. Provide thorough, well-reasoned responses.";
     public Dictionary<string, string> AgentPromptOverrides { get; set; } = new();
+    public string CodeTheme { get; set; } = "github-dark";
     public string EvaluatorPrompt { get; set; } = """
         You are an expert evaluator. You will receive multiple AI-generated responses
         to the same user prompt. Analyze each response for:

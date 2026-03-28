@@ -204,6 +204,7 @@ function edgeTo(pos: { x: number; y: number }) {
 .viz-badge.idle { background: rgba(255,255,255,0.05); color: var(--text-secondary); }
 .viz-badge.fan-out { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
 .viz-badge.evaluating { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
+.viz-badge.awaiting-input { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
 .viz-badge.awaiting-approval { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
 .viz-badge.accepted { background: rgba(16,185,129,0.15); color: var(--accent-green); }
 .viz-badge.declined { background: rgba(239,68,68,0.15); color: var(--accent-red); }

@@ -4,11 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## 2026-03-28
+
+### Fixed
+
+- Prevent frontend freeze during markdown rendering by centralizing highlight configuration and removing expensive `highlightAuto` fallback.
+- Add guarded highlighting path that escapes very large/unknown-language code blocks instead of auto-detecting language.
+- Reuse a shared markdown renderer across `ChatBubble` and `ChatView` to avoid repeated parser/plugin setup.
+
+## 2026-03-28
+
+### Added
+
+- Code syntax highlighting with `highlight.js` + `marked-highlight` for chat/evaluator markdown blocks
+- Settings option for code theme selection (`github-dark`, `atom-one-dark`, `night-owl`, `tokyo-night-dark`, `monokai`)
+- Persisted `codeTheme` in shared `PromptConfig`, applied at frontend startup
+- Message anchoring metadata (`messageId`, `parentMessageId`, `contextMessageId`) to keep HITL prompts tied to originating agent responses
+
+### Changed
+
+- Question answer handling now continues only the originating agent branch instead of rebuilding a global retry prompt
+- Inline question card is rendered in the original agent response pane via message-context matching
+- Follow-up re-questions from a continued agent response are appended as contextual child questions in chat history
+
+### Fixed
+
+- Cross-agent answer bleed where the last answer could affect all pending questions
+- Chat context reset after answering questions; session chat history now remains intact through continuation flow
+
 ### Added
 
 - PrimeVue Accordion for right panel — replaces custom collapse wrapper with three panels: Orchestration, Evaluator, Accepted Response
 - Auto-panel switching: Orchestration expands on fan-out, Evaluator on awaiting-approval, Accepted on accept
 - Status badge in Orchestration accordion header shows current state (idle/fan-out/evaluating/awaiting-approval/accepted)
+- AG-UI question loop: new `question_required` event + `AwaitingInput` state; inline question card supports free-text/single-choice/multi-choice answers and resumes orchestration with user clarification
+- Natural-language fallback question detection: inline AG-UI prompts now trigger on plain agent questions (e.g., lines ending with `?` and user-input cues), not only `[QUESTION]` markers
+- Moved AG-UI question answering from bottom bar to inline chat card under agent/evaluator flow for per-response context
+- Multi-question queue support: when multiple agents ask follow-ups, each question is queued and presented inline one-by-one until all are answered
 - Visual score cards with color-coded progress bars per dimension (Accuracy, Completeness, Clarity, Relevance), winner glow highlight, sorted by total score
 - Redesigned Settings page — two-column layout with icon headers, PrimeVue Tabs for per-agent prompt overrides, model badges, inherit hint indicator
 - "New Chat" button in top navigation bar — resets state, clears prompt, and focuses input

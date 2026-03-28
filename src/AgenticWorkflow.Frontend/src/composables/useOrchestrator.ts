@@ -1,5 +1,13 @@
 import { ref, reactive } from 'vue'
-import type { SessionState, StreamEvent, AgentNode, OrchestratorState, PromptConfig, AcceptedResponse } from '../types'
+import type {
+  SessionState,
+  StreamEvent,
+  AgentNode,
+  OrchestratorState,
+  PromptConfig,
+  AcceptedResponse,
+  UserQuestion,
+} from '../types'
 
 const sessions = ref<SessionState[]>([])
 const currentSession = ref<SessionState | null>(null)
@@ -12,6 +20,7 @@ const agents = reactive<AgentNode[]>([
 const isProcessing = ref(false)
 const error = ref<string | null>(null)
 const acceptedResponse = ref<AcceptedResponse | null>(null)
+const pendingQuestion = ref<UserQuestion | null>(null)
 let lastSubmittedPrompt = ''
 
 export function useOrchestrator() {
@@ -92,6 +101,9 @@ export function useOrchestrator() {
         } else if (event.status === 'Evaluating') {
           orchestratorState.value = 'evaluating'
           agents.forEach(a => { if (a.status === 'running') a.status = 'complete' })
+        } else if (event.status === 'AwaitingInput') {
+          orchestratorState.value = 'awaiting-input'
+          agents.forEach(a => { if (a.status === 'running') a.status = 'complete' })
         } else if (event.status === 'AwaitingApproval') {
           orchestratorState.value = 'awaiting-approval'
         } else if (event.status === 'Failed') {
@@ -128,6 +140,7 @@ export function useOrchestrator() {
           currentSession.value?.agentResults.push(event.agentResult)
           currentSession.value?.chatHistory.push({
             role: 'agent',
+            messageId: event.messageId,
             content: event.agentResult.responseText,
             agentName: event.agentResult.agentName,
             timestamp: event.timestamp,
@@ -137,6 +150,7 @@ export function useOrchestrator() {
 
       case 'evaluation':
         if (event.evaluation) {
+          pendingQuestion.value = null
           orchestratorState.value = 'awaiting-approval'
           if (currentSession.value) {
             currentSession.value.evaluation = event.evaluation
@@ -151,10 +165,38 @@ export function useOrchestrator() {
           )
           const winnerContent = winnerResult?.responseText ?? 'No response available'
 
+          const alreadyHasEvaluator = currentSession.value?.chatHistory.some(
+            m => m.role === 'evaluator' && m.agentName === event.evaluation!.winner && m.content === winnerContent
+          )
+          if (!alreadyHasEvaluator) {
+            currentSession.value?.chatHistory.push({
+              role: 'evaluator',
+              content: winnerContent,
+              agentName: event.evaluation.winner,
+              timestamp: event.timestamp,
+            })
+          }
+        }
+        break
+
+      case 'question_required':
+        if (event.question) {
+          orchestratorState.value = 'awaiting-input'
+          if (currentSession.value) {
+            currentSession.value.status = 'AwaitingInput'
+            const queue = currentSession.value.pendingQuestions ?? []
+            const exists = queue.some(q => q.questionId === event.question!.questionId)
+            if (!exists) queue.push(event.question)
+            currentSession.value.pendingQuestions = queue
+            if (!pendingQuestion.value) {
+              pendingQuestion.value = queue[0] ?? null
+            }
+          }
           currentSession.value?.chatHistory.push({
-            role: 'evaluator',
-            content: winnerContent,
-            agentName: event.evaluation.winner,
+            role: 'question',
+            parentMessageId: event.question.contextMessageId,
+            content: event.question.prompt,
+            agentName: event.question.sourceName || event.question.source,
             timestamp: event.timestamp,
           })
         }
@@ -171,7 +213,16 @@ export function useOrchestrator() {
 
   async function submitDecision(sessionId: string, decision: 'accept' | 'decline' | 'restart') {
     if (decision === 'decline') {
-      // Cancel — just return to chat input, keep session visible
+      // Persist decline and sync queue/session state
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}/decide`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision: 'decline' }),
+        })
+        if (res.ok) currentSession.value = await res.json()
+      } catch { /* non-critical */ }
+      pendingQuestion.value = null
       orchestratorState.value = 'idle'
       agents.forEach(a => { a.status = 'idle'; a.elapsedMs = undefined })
       return
@@ -223,6 +274,47 @@ export function useOrchestrator() {
     await submitPrompt(prompt)
   }
 
+  async function submitQuestionAnswer(
+    sessionId: string,
+    questionId: string,
+    answerText: string,
+    selectedChoices: string[],
+  ) {
+    const response = await fetch(`/api/sessions/${sessionId}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        questionId,
+        answerText: answerText || null,
+        selectedChoices,
+      }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Failed to submit answer: HTTP ${response.status}`)
+    }
+
+    const updated: SessionState = await response.json()
+    currentSession.value = updated
+
+    const remaining = updated.pendingQuestions ?? []
+    pendingQuestion.value = remaining[0] ?? null
+    orchestratorState.value = pendingQuestion.value
+      ? 'awaiting-input'
+      : (updated.status === 'AwaitingApproval' ? 'awaiting-approval' : 'fan-out')
+
+    if (pendingQuestion.value) {
+      // More questions remain; do not restart orchestration yet.
+      return
+    }
+
+    // Backend now continues only the originating agent branch and returns updated state.
+    if (updated.status === 'AwaitingApproval' && updated.evaluation) {
+      const winnerAgent = agents.find(a => a.name === updated.evaluation!.winner)
+      if (winnerAgent) winnerAgent.status = 'winner'
+    }
+  }
+
   async function recoverSession(sessionId: string) {
     const res = await fetch(`/api/sessions/${sessionId}/recover`, {
       method: 'POST',
@@ -241,7 +333,42 @@ export function useOrchestrator() {
 
   async function loadSession(id: string) {
     const res = await fetch(`/api/sessions/${id}`)
-    if (res.ok) currentSession.value = await res.json()
+    if (!res.ok) return
+
+    const loaded: SessionState | null = await res.json()
+    if (!loaded) {
+      currentSession.value = null
+      pendingQuestion.value = null
+      orchestratorState.value = 'idle'
+      return
+    }
+
+    currentSession.value = loaded
+    pendingQuestion.value = loaded.pendingQuestions?.[0] ?? null
+
+    switch (loaded.status) {
+      case 'AgentsRunning':
+        orchestratorState.value = 'fan-out'
+        break
+      case 'Evaluating':
+        orchestratorState.value = 'evaluating'
+        break
+      case 'AwaitingInput':
+        orchestratorState.value = 'awaiting-input'
+        break
+      case 'AwaitingApproval':
+        orchestratorState.value = 'awaiting-approval'
+        break
+      case 'Accepted':
+        orchestratorState.value = 'accepted'
+        break
+      case 'Failed':
+        orchestratorState.value = 'failed'
+        break
+      default:
+        orchestratorState.value = 'idle'
+        break
+    }
   }
 
   async function getPromptConfig(): Promise<PromptConfig> {
@@ -265,6 +392,7 @@ export function useOrchestrator() {
     agents.forEach(a => { a.status = 'idle'; a.elapsedMs = undefined })
     error.value = null
     acceptedResponse.value = null
+    pendingQuestion.value = null
   }
 
   return {
@@ -275,8 +403,10 @@ export function useOrchestrator() {
     isProcessing,
     error,
     acceptedResponse,
+    pendingQuestion,
     submitPrompt,
     submitDecision,
+    submitQuestionAnswer,
     recoverSession,
     loadSessions,
     loadSession,

@@ -8,6 +8,10 @@ import Tooltip from 'primevue/tooltip'
 import 'primeicons/primeicons.css'
 import './style.css'
 import App from './App.vue'
+import { applyCodeTheme } from './utils/codeTheme'
+
+const savedCodeTheme = localStorage.getItem('codeTheme') ?? 'github-dark'
+void applyCodeTheme(savedCodeTheme)
 
 const router = createRouter({
   history: createWebHistory(),

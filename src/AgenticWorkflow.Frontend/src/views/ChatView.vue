@@ -1,26 +1,20 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
 import { useOrchestrator } from '../composables/useOrchestrator'
 import OrchestratorVisualizer from '../components/OrchestratorVisualizer.vue'
 import ChatBubble from '../components/ChatBubble.vue'
+import { renderMarkdown } from '../utils/markdown'
 import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
+import Textarea from 'primevue/textarea'
 import Accordion from 'primevue/accordion'
 import AccordionPanel from 'primevue/accordionpanel'
 import AccordionHeader from 'primevue/accordionheader'
 import AccordionContent from 'primevue/accordioncontent'
 
-marked.setOptions({ breaks: true, gfm: true })
-
-function renderMarkdown(text: string): string {
-  return DOMPurify.sanitize(marked.parse(text) as string)
-}
-
 const {
   currentSession, orchestratorState, agents, isProcessing, error, acceptedResponse,
-  submitPrompt, submitDecision, recoverSession, loadSessions, sessions, loadSession, resetState,
+  pendingQuestion, submitPrompt, submitDecision, submitQuestionAnswer, recoverSession, loadSessions, sessions, loadSession, resetState,
 } = useOrchestrator()
 
 const promptInput = ref('')
@@ -29,10 +23,20 @@ const chatContainer = ref<HTMLElement>()
 const expandedAgents = ref<Set<string>>(new Set())
 const copySuccess = ref(false)
 const activePanel = ref<string | null>('orchestration')
+const questionAnswerText = ref('')
+const questionChoice = ref('')
+const questionChoices = ref<Set<string>>(new Set())
+
+function isAwaitingQuestionForMessage(messageId?: string) {
+  if (orchestratorState.value !== 'awaiting-input' || !messageId) return false
+  return pendingQuestion.value?.contextMessageId === messageId
+}
 
 // Auto-switch accordion panel based on orchestration state
 watch(() => orchestratorState.value, (newState) => {
   if (newState === 'fan-out' || newState === 'evaluating') {
+    activePanel.value = 'orchestration'
+  } else if (newState === 'awaiting-input') {
     activePanel.value = 'orchestration'
   } else if (newState === 'awaiting-approval') {
     activePanel.value = 'evaluator'
@@ -91,6 +95,11 @@ async function handleSubmit() {
 async function handleDecision(d: 'accept' | 'decline' | 'restart') {
   if (!currentSession.value) return
   await submitDecision(currentSession.value.id, d)
+  if (d === 'decline') {
+    questionAnswerText.value = ''
+    questionChoice.value = ''
+    questionChoices.value = new Set()
+  }
 }
 
 async function handleRecover() {
@@ -100,6 +109,34 @@ async function handleRecover() {
   const prompt = currentSession.value.prompt
   resetState()
   await submitPrompt(prompt)
+}
+
+function toggleQuestionChoice(choice: string) {
+  const next = new Set(questionChoices.value)
+  if (next.has(choice)) next.delete(choice)
+  else next.add(choice)
+  questionChoices.value = next
+}
+
+async function handleSubmitQuestionAnswer() {
+  if (!currentSession.value || !pendingQuestion.value) return
+  const q = pendingQuestion.value
+  if (q.inputType === 'SingleChoice' && !questionChoice.value) return
+  if (q.inputType === 'MultiChoice' && questionChoices.value.size === 0) return
+  if (q.inputType === 'FreeText' && !questionAnswerText.value.trim()) return
+
+  const selectedChoices =
+    q.inputType === 'SingleChoice'
+      ? [questionChoice.value]
+      : q.inputType === 'MultiChoice'
+        ? Array.from(questionChoices.value)
+        : []
+
+  const answerText = q.inputType === 'FreeText' ? questionAnswerText.value.trim() : ''
+  await submitQuestionAnswer(currentSession.value.id, q.questionId, answerText, selectedChoices)
+  questionAnswerText.value = ''
+  questionChoice.value = ''
+  questionChoices.value = new Set()
 }
 
 function handleKeydown(e: KeyboardEvent) {
@@ -142,7 +179,7 @@ function truncateText(text: string, maxLen: number): string {
 
 const acceptedResponseHtml = computed(() => {
   if (!acceptedResponse.value) return ''
-  return DOMPurify.sanitize(marked.parse(acceptedResponse.value.responseText) as string)
+  return renderMarkdown(acceptedResponse.value.responseText)
 })
 
 async function copyToClipboard() {
@@ -210,11 +247,127 @@ const sidebarOpen = ref(false)
 
         <!-- Chat Messages -->
         <template v-if="currentSession">
-          <ChatBubble
-            v-for="(msg, i) in currentSession.chatHistory"
-            :key="i"
-            :message="msg"
-          />
+          <template v-for="(msg, i) in currentSession.chatHistory" :key="i">
+            <ChatBubble :message="msg" />
+
+            <!-- Inline AG-UI question response (attached to originating agent pane) -->
+            <div v-if="msg.role === 'agent' && isAwaitingQuestionForMessage(msg.messageId) && pendingQuestion" class="inline-question-card">
+            <div class="question-header">
+              <span class="question-title">
+                <i class="pi pi-question-circle" style="color: var(--accent-purple)"></i>
+                {{ pendingQuestion.sourceName || pendingQuestion.source }} needs your input
+              </span>
+              <span class="question-type">{{ pendingQuestion.inputType }}</span>
+            </div>
+            <div class="question-prompt">{{ pendingQuestion.prompt }}</div>
+            <div v-if="(currentSession?.pendingQuestions?.length ?? 0) > 1" class="question-queue-hint">
+              {{ currentSession?.pendingQuestions?.length }} questions pending
+            </div>
+
+            <div v-if="pendingQuestion.inputType === 'SingleChoice'" class="question-choices">
+              <button
+                v-for="choice in pendingQuestion.choices"
+                :key="choice"
+                :class="['choice-chip', { selected: questionChoice === choice }]"
+                @click="questionChoice = choice"
+              >{{ choice }}</button>
+            </div>
+
+            <div v-else-if="pendingQuestion.inputType === 'MultiChoice'" class="question-choices">
+              <button
+                v-for="choice in pendingQuestion.choices"
+                :key="choice"
+                :class="['choice-chip', { selected: questionChoices.has(choice) }]"
+                @click="toggleQuestionChoice(choice)"
+              >{{ choice }}</button>
+            </div>
+
+            <Textarea
+              v-else
+              v-model="questionAnswerText"
+              rows="3"
+              autoResize
+              class="question-input mono"
+              placeholder="Type your answer..."
+            />
+
+            <div class="approval-buttons">
+              <Button
+                label="Submit Answer"
+                icon="pi pi-check"
+                severity="success"
+                size="small"
+                @click="handleSubmitQuestionAnswer"
+                :disabled="
+                  (pendingQuestion.inputType === 'FreeText' && !questionAnswerText.trim()) ||
+                  (pendingQuestion.inputType === 'SingleChoice' && !questionChoice) ||
+                  (pendingQuestion.inputType === 'MultiChoice' && questionChoices.size === 0)
+                "
+              />
+              <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined @click="handleDecision('decline')" />
+            </div>
+          </div>
+          </template>
+
+          <div
+            v-if="orchestratorState === 'awaiting-input' && pendingQuestion && !pendingQuestion.contextMessageId"
+            class="inline-question-card"
+          >
+            <div class="question-header">
+              <span class="question-title">
+                <i class="pi pi-question-circle" style="color: var(--accent-purple)"></i>
+                {{ pendingQuestion.sourceName || pendingQuestion.source }} needs your input
+              </span>
+              <span class="question-type">{{ pendingQuestion.inputType }}</span>
+            </div>
+            <div class="question-prompt">{{ pendingQuestion.prompt }}</div>
+            <div v-if="(currentSession?.pendingQuestions?.length ?? 0) > 1" class="question-queue-hint">
+              {{ currentSession?.pendingQuestions?.length }} questions pending
+            </div>
+
+            <div v-if="pendingQuestion.inputType === 'SingleChoice'" class="question-choices">
+              <button
+                v-for="choice in pendingQuestion.choices"
+                :key="choice"
+                :class="['choice-chip', { selected: questionChoice === choice }]"
+                @click="questionChoice = choice"
+              >{{ choice }}</button>
+            </div>
+
+            <div v-else-if="pendingQuestion.inputType === 'MultiChoice'" class="question-choices">
+              <button
+                v-for="choice in pendingQuestion.choices"
+                :key="choice"
+                :class="['choice-chip', { selected: questionChoices.has(choice) }]"
+                @click="toggleQuestionChoice(choice)"
+              >{{ choice }}</button>
+            </div>
+
+            <Textarea
+              v-else
+              v-model="questionAnswerText"
+              rows="3"
+              autoResize
+              class="question-input mono"
+              placeholder="Type your answer..."
+            />
+
+            <div class="approval-buttons">
+              <Button
+                label="Submit Answer"
+                icon="pi pi-check"
+                severity="success"
+                size="small"
+                @click="handleSubmitQuestionAnswer"
+                :disabled="
+                  (pendingQuestion.inputType === 'FreeText' && !questionAnswerText.trim()) ||
+                  (pendingQuestion.inputType === 'SingleChoice' && !questionChoice) ||
+                  (pendingQuestion.inputType === 'MultiChoice' && questionChoices.size === 0)
+                "
+              />
+              <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined @click="handleDecision('decline')" />
+            </div>
+          </div>
         </template>
 
         <!-- Error -->
@@ -391,6 +544,12 @@ const sidebarOpen = ref(false)
           <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined @click="handleDecision('decline')" />
         </div>
       </div>
+      <div v-else-if="orchestratorState === 'awaiting-input'" class="approval-bar">
+        <span class="approval-text">
+          <i class="pi pi-comment" style="color: var(--accent-purple)"></i>
+          Respond inline in the chat above
+        </span>
+      </div>
       <div v-else-if="currentSession?.status === 'Failed'" class="approval-bar">
         <span class="approval-text">
           <i class="pi pi-exclamation-triangle" style="color: var(--accent-red)"></i>
@@ -490,6 +649,7 @@ const sidebarOpen = ref(false)
 .status-dot.created { background: var(--text-secondary); }
 .status-dot.agentsrunning { background: var(--accent-blue); }
 .status-dot.evaluating { background: var(--accent-amber); }
+.status-dot.awaitinginput { background: var(--accent-purple); }
 .status-dot.awaitingapproval { background: var(--accent-purple); }
 .status-dot.accepted { background: var(--accent-green); }
 .status-dot.declined { background: var(--accent-red); }
@@ -624,6 +784,7 @@ const sidebarOpen = ref(false)
 .viz-mini-badge.idle { background: rgba(255,255,255,0.05); color: var(--text-secondary); }
 .viz-mini-badge.fan-out { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
 .viz-mini-badge.evaluating { background: rgba(245,158,11,0.15); color: var(--accent-amber); }
+.viz-mini-badge.awaiting-input { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
 .viz-mini-badge.awaiting-approval { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
 .viz-mini-badge.accepted { background: rgba(16,185,129,0.15); color: var(--accent-green); }
 .scores-section {
@@ -896,13 +1057,17 @@ const sidebarOpen = ref(false)
 .markdown-body :deep(p) { margin-bottom: 0.5rem; }
 .markdown-body :deep(p:last-child) { margin-bottom: 0; }
 .markdown-body :deep(pre) {
-  background: rgba(0, 0, 0, 0.3);
+  background: rgba(0, 0, 0, 0.2);
   border-radius: 6px;
   padding: 0.75rem;
   overflow-x: auto;
   margin: 0.5rem 0;
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.8rem;
+}
+.markdown-body :deep(pre code.hljs) {
+  display: block;
+  border-radius: 6px;
 }
 .markdown-body :deep(code) {
   font-family: 'JetBrains Mono', monospace;
@@ -981,5 +1146,74 @@ const sidebarOpen = ref(false)
 .approval-buttons {
   display: flex;
   gap: 0.5rem;
+}
+
+.question-bar,
+.inline-question-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.inline-question-card {
+  margin: 0.25rem 0 0.9rem;
+  max-width: 85%;
+  background: rgba(139, 92, 246, 0.05);
+  border: 1px solid rgba(139, 92, 246, 0.2);
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+}
+.question-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.question-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.9rem;
+}
+.question-type {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent-purple);
+  border: 1px solid rgba(139,92,246,0.3);
+  background: rgba(139,92,246,0.08);
+  border-radius: 4px;
+  padding: 0.1rem 0.35rem;
+}
+.question-prompt {
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+.question-queue-hint {
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+.question-choices {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.choice-chip {
+  border: 1px solid var(--border-glass);
+  background: var(--bg-glass);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.choice-chip.selected {
+  border-color: rgba(139,92,246,0.45);
+  background: rgba(139,92,246,0.14);
+  color: var(--text-primary);
+}
+.question-input {
+  width: 100%;
+  background: var(--bg-glass) !important;
+  border-color: var(--border-glass) !important;
+  color: var(--text-primary) !important;
 }
 </style>

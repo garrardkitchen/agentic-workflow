@@ -30,8 +30,10 @@ export interface EvaluationResult {
 }
 
 export interface ChatMessage {
-  role: 'user' | 'agent' | 'evaluator' | 'system'
+  role: 'user' | 'agent' | 'evaluator' | 'system' | 'question' | 'answer'
   content: string
+  messageId?: string
+  parentMessageId?: string
   agentName?: string
   timestamp: string
 }
@@ -40,11 +42,32 @@ export type SessionStatus =
   | 'Created'
   | 'AgentsRunning'
   | 'Evaluating'
+  | 'AwaitingInput'
   | 'AwaitingApproval'
   | 'Accepted'
   | 'Declined'
   | 'Restarted'
   | 'Failed'
+
+export type QuestionInputType = 'FreeText' | 'SingleChoice' | 'MultiChoice'
+
+export interface UserQuestion {
+  questionId: string
+  source: 'agent' | 'evaluator'
+  sourceName?: string
+  prompt: string
+  contextMessageId?: string
+  inputType: QuestionInputType
+  choices: string[]
+  timestamp: string
+}
+
+export interface UserQuestionAnswer {
+  questionId: string
+  answerText?: string
+  selectedChoices: string[]
+  answeredAt: string
+}
 
 export interface SessionState {
   id: string
@@ -53,19 +76,23 @@ export interface SessionState {
   status: SessionStatus
   agentResults: AgentResult[]
   evaluation?: EvaluationResult
+  pendingQuestions?: UserQuestion[]
+  answeredQuestions?: UserQuestionAnswer[]
   chatHistory: ChatMessage[]
   createdAt: string
   updatedAt: string
 }
 
 export interface StreamEvent {
-  type: 'status' | 'agent_token' | 'agent_complete' | 'evaluation' | 'error'
+  type: 'status' | 'agent_token' | 'agent_complete' | 'evaluation' | 'question_required' | 'error'
   sessionId: string
   agentName?: string
+  messageId?: string
   content?: string
   status?: SessionStatus
   agentResult?: AgentResult
   evaluation?: EvaluationResult
+  question?: UserQuestion
   timestamp: string
 }
 
@@ -73,9 +100,10 @@ export interface PromptConfig {
   drivingSystemPrompt: string
   agentPromptOverrides: Record<string, string>
   evaluatorPrompt: string
+  codeTheme?: string
 }
 
-export type OrchestratorState = 'idle' | 'fan-out' | 'evaluating' | 'awaiting-approval' | 'accepted' | 'declined' | 'failed'
+export type OrchestratorState = 'idle' | 'fan-out' | 'evaluating' | 'awaiting-input' | 'awaiting-approval' | 'accepted' | 'declined' | 'failed'
 
 export interface AcceptedResponse {
   agentName: string

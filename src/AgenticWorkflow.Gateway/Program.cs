@@ -1,5 +1,7 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
 using AgenticWorkflow.Shared.Models;
 using AgenticWorkflow.Shared.Services;
 using GitHub.Copilot.SDK;
@@ -56,6 +58,7 @@ app.MapDefaultEndpoints();
 app.UseCors();
 
 var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+var sessionMutationLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
 
 // ── Prompt Config Endpoints ───────────────────────────────────────────
 
@@ -147,24 +150,27 @@ app.MapPost("/api/orchestrate", async (
 
             if (result is not null)
             {
+                var messageId = $"m-{Guid.NewGuid():N}";
                 await SendEvent(httpContext, new StreamEvent
                 {
                     Type = "agent_complete",
                     SessionId = session.Id,
                     AgentName = result.AgentName,
+                    MessageId = messageId,
                     Content = result.ResponseText,
                     AgentResult = result
                 }, jsonOptions, sseLock);
+                return (Result: result, MessageId: messageId);
             }
 
-            return result ?? new AgentResult
+            return (Result: result ?? new AgentResult
             {
                 AgentName = name,
                 Model = "unknown",
                 ResponseText = "",
                 Failed = true,
                 Error = "Null response"
-            };
+            }, MessageId: (string?)null);
         }
         catch (Exception ex)
         {
@@ -177,19 +183,33 @@ app.MapPost("/api/orchestrate", async (
                 Content = $"Agent {name} failed: {ex.Message}"
             }, jsonOptions, sseLock);
 
-            return new AgentResult
+            return (Result: new AgentResult
             {
                 AgentName = name,
                 Model = "unknown",
                 ResponseText = "",
                 Failed = true,
                 Error = ex.Message
-            };
+            }, MessageId: (string?)null);
         }
     });
 
-    var results = await Task.WhenAll(agentTasks);
+    var executions = await Task.WhenAll(agentTasks);
+    var results = executions.Select(e => e.Result).ToArray();
     session.AgentResults = [.. results];
+    var agentMessageContext = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var execution in executions.Where(e => !e.Result.Failed))
+    {
+        var messageId = execution.MessageId ?? $"m-{Guid.NewGuid():N}";
+        agentMessageContext[execution.Result.AgentName] = messageId;
+        session.ChatHistory.Add(new ChatMessage
+        {
+            Role = "agent",
+            MessageId = messageId,
+            Content = execution.Result.ResponseText,
+            AgentName = execution.Result.AgentName
+        });
+    }
 
     // Check if all agents failed
     if (results.All(r => r.Failed))
@@ -217,6 +237,42 @@ app.MapPost("/api/orchestrate", async (
     logger.LogInformation("Session {SessionId} — {SuccessCount}/{TotalCount} agents succeeded",
         session.Id, results.Count(r => !r.Failed), results.Length);
 
+    // ── Human Input Gate (AG-UI) ──────────────────────────────────────
+    var followUpQuestions = TryExtractUserQuestions(results, agentMessageContext);
+    if (followUpQuestions.Count > 0)
+    {
+        session.PendingQuestions.AddRange(followUpQuestions);
+        session.Status = SessionStatus.AwaitingInput;
+        foreach (var q in followUpQuestions)
+        {
+            session.ChatHistory.Add(new ChatMessage
+            {
+                Role = "question",
+                ParentMessageId = q.ContextMessageId,
+                Content = q.Prompt,
+                AgentName = q.SourceName
+            });
+        }
+        await sessionStore.UpdateAsync(session, ct);
+
+        foreach (var q in followUpQuestions)
+        {
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "question_required",
+                SessionId = session.Id,
+                Content = q.Prompt,
+                Question = q,
+                Status = SessionStatus.AwaitingInput
+            }, jsonOptions, sseLock);
+        }
+
+        logger.LogInformation(
+            "Session {SessionId} awaiting user input with {QuestionCount} follow-up questions",
+            session.Id, followUpQuestions.Count);
+        return;
+    }
+
     // ── Evaluate ─────────────────────────────────────────────────────
     session.Status = SessionStatus.Evaluating;
     await sessionStore.UpdateAsync(session, ct);
@@ -231,17 +287,6 @@ app.MapPost("/api/orchestrate", async (
 
     var evaluation = await EvaluateResponsesAsync(results, request.Prompt, promptConfig.EvaluatorPrompt, copilotClient, logger);
     session.Evaluation = evaluation;
-
-    // Add agent responses to chat history
-    foreach (var r in results.Where(r => !r.Failed))
-    {
-        session.ChatHistory.Add(new ChatMessage
-        {
-            Role = "agent",
-            Content = r.ResponseText,
-            AgentName = r.AgentName
-        });
-    }
 
     session.ChatHistory.Add(new ChatMessage
     {
@@ -302,34 +347,220 @@ app.MapPost("/api/sessions/{id}/decide", async (
     ILogger<Program> logger,
     CancellationToken ct) =>
 {
-    var validDecisions = new[] { "accept", "decline", "restart" };
-    if (!validDecisions.Contains(decision.Decision))
-        return Results.BadRequest(new { error = $"Invalid decision '{decision.Decision}'. Must be one of: {string.Join(", ", validDecisions)}" });
-
-    var session = await sessionStore.GetAsync(id, ct);
-    if (session is null) return Results.NotFound();
-
-    if (session.Status != SessionStatus.AwaitingApproval)
-        return Results.BadRequest(new { error = $"Session is not awaiting approval (current status: {session.Status})" });
-
-    session.Status = decision.Decision switch
+    var sessionLock = sessionMutationLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+    await sessionLock.WaitAsync(ct);
+    try
     {
-        "accept" => SessionStatus.Accepted,
-        "decline" => SessionStatus.Declined,
-        "restart" => SessionStatus.Restarted,
-        _ => session.Status
-    };
+        var validDecisions = new[] { "accept", "decline", "restart" };
+        if (!validDecisions.Contains(decision.Decision))
+            return Results.BadRequest(new { error = $"Invalid decision '{decision.Decision}'. Must be one of: {string.Join(", ", validDecisions)}" });
 
-    session.ChatHistory.Add(new ChatMessage
+        var session = await sessionStore.GetAsync(id, ct);
+        if (session is null) return Results.NotFound();
+
+        if (session.Status == SessionStatus.AwaitingInput)
+        {
+            if (decision.Decision != "decline")
+                return Results.BadRequest(new { error = "Only 'decline' is allowed while awaiting user input." });
+
+            session.PendingQuestions.Clear();
+            session.Status = SessionStatus.Declined;
+        }
+        else if (session.Status == SessionStatus.AwaitingApproval)
+        {
+            session.Status = decision.Decision switch
+            {
+                "accept" => SessionStatus.Accepted,
+                "decline" => SessionStatus.Declined,
+                "restart" => SessionStatus.Restarted,
+                _ => session.Status
+            };
+        }
+        else
+        {
+            return Results.BadRequest(new { error = $"Session is not in a decision state (current status: {session.Status})" });
+        }
+
+        session.ChatHistory.Add(new ChatMessage
+        {
+            Role = "system",
+            Content = $"User decision: {decision.Decision}"
+        });
+
+        await sessionStore.UpdateAsync(session, ct);
+        logger.LogInformation("Session {SessionId} decision: {Decision}", id, decision.Decision);
+
+        return Results.Ok(session);
+    }
+    finally
     {
-        Role = "system",
-        Content = $"User decision: {decision.Decision}"
-    });
+        sessionLock.Release();
+    }
+});
 
-    await sessionStore.UpdateAsync(session, ct);
-    logger.LogInformation("Session {SessionId} decision: {Decision}", id, decision.Decision);
+// ── Question Answer Endpoint ──────────────────────────────────────────
 
-    return Results.Ok(session);
+app.MapPost("/api/sessions/{id}/answer", async (
+    string id,
+    QuestionAnswerRequest answer,
+    ISessionStore sessionStore,
+    IPromptConfigStore promptStore,
+    IHttpClientFactory httpClientFactory,
+    CopilotClient copilotClient,
+    ILogger<Program> logger,
+    CancellationToken ct) =>
+{
+    var sessionLock = sessionMutationLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+    await sessionLock.WaitAsync(ct);
+    try
+    {
+        var session = await sessionStore.GetAsync(id, ct);
+        if (session is null) return Results.NotFound();
+
+        if (session.Status != SessionStatus.AwaitingInput || session.PendingQuestions.Count == 0)
+            return Results.BadRequest(new { error = $"Session is not awaiting input (current status: {session.Status})" });
+
+        var question = session.PendingQuestions.FirstOrDefault(q => q.QuestionId == answer.QuestionId);
+        if (question is null)
+            return Results.BadRequest(new { error = $"Question '{answer.QuestionId}' not found for this session." });
+
+        if (question.InputType == QuestionInputType.FreeText && string.IsNullOrWhiteSpace(answer.AnswerText))
+            return Results.BadRequest(new { error = "Answer text is required for free-text questions." });
+
+        if (question.InputType != QuestionInputType.FreeText && (answer.SelectedChoices is null || answer.SelectedChoices.Count == 0))
+            return Results.BadRequest(new { error = "At least one selected choice is required for choice questions." });
+
+        if (question.InputType == QuestionInputType.SingleChoice && (answer.SelectedChoices is null || answer.SelectedChoices.Count != 1))
+            return Results.BadRequest(new { error = "SingleChoice questions require exactly one selected choice." });
+
+        if (question.InputType != QuestionInputType.FreeText && answer.SelectedChoices is not null)
+        {
+            var invalidChoices = answer.SelectedChoices
+                .Where(c => !question.Choices.Contains(c, StringComparer.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (invalidChoices.Count > 0)
+                return Results.BadRequest(new { error = $"Invalid choices: {string.Join(", ", invalidChoices)}" });
+        }
+
+        session.PendingQuestions.RemoveAll(q => q.QuestionId == question.QuestionId);
+        var recorded = new UserQuestionAnswer
+        {
+            QuestionId = question.QuestionId,
+            AnswerText = answer.AnswerText,
+            SelectedChoices = answer.SelectedChoices ?? []
+        };
+        session.AnsweredQuestions.Add(recorded);
+
+        var renderedAnswer = !string.IsNullOrWhiteSpace(answer.AnswerText)
+            ? answer.AnswerText!
+            : string.Join(", ", answer.SelectedChoices ?? []);
+
+        session.ChatHistory.Add(new ChatMessage
+        {
+            Role = "answer",
+            Content = renderedAnswer,
+            ParentMessageId = question.ContextMessageId,
+            AgentName = question.SourceName
+        });
+
+        // Continue only the originating agent thread with this clarification.
+        if (!string.IsNullOrWhiteSpace(question.SourceName))
+        {
+            var serviceName = GetServiceNameForAgent(question.SourceName);
+            if (serviceName is null)
+                return Results.BadRequest(new { error = $"Unknown question source '{question.SourceName}'." });
+
+            var promptConfig = await promptStore.GetAsync(ct);
+            var defaultPrompt = session.SystemPrompt ?? promptConfig.DrivingSystemPrompt;
+            var agentPrompt = GetAgentPrompt(promptConfig, serviceName, defaultPrompt);
+            var continuationPrompt = BuildAgentContinuationPrompt(session.Prompt, question.Prompt, renderedAnswer);
+
+            var client = httpClientFactory.CreateClient(serviceName);
+            var continuationRequest = new AgentRequest
+            {
+                Prompt = continuationPrompt,
+                SessionId = session.Id,
+                SystemPromptOverride = agentPrompt
+            };
+
+            var continuationResponse = await client.PostAsJsonAsync("/api/run", continuationRequest, ct);
+            continuationResponse.EnsureSuccessStatusCode();
+            var updatedResult = await continuationResponse.Content.ReadFromJsonAsync<AgentResult>(ct);
+            if (updatedResult is not null)
+            {
+                var existing = session.AgentResults.FindIndex(r => r.AgentName == updatedResult.AgentName);
+                if (existing >= 0) session.AgentResults[existing] = updatedResult;
+                else session.AgentResults.Add(updatedResult);
+
+                session.ChatHistory.Add(new ChatMessage
+                {
+                    Role = "agent",
+                    MessageId = $"m-{Guid.NewGuid():N}",
+                    ParentMessageId = question.ContextMessageId,
+                    Content = updatedResult.ResponseText,
+                    AgentName = updatedResult.AgentName
+                });
+                var contextMessageId = session.ChatHistory.Last().MessageId;
+
+                var contextByAgent = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (!string.IsNullOrWhiteSpace(contextMessageId))
+                {
+                    contextByAgent[updatedResult.AgentName] = contextMessageId;
+                }
+
+                var followUps = TryExtractUserQuestions([updatedResult], contextByAgent);
+                foreach (var followUp in followUps)
+                {
+                    var duplicatePending = session.PendingQuestions.Any(p =>
+                        string.Equals(p.SourceName, followUp.SourceName, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(p.Prompt.Trim(), followUp.Prompt.Trim(), StringComparison.OrdinalIgnoreCase));
+                    if (!duplicatePending)
+                    {
+                        session.PendingQuestions.Add(followUp);
+                        session.ChatHistory.Add(new ChatMessage
+                        {
+                            Role = "question",
+                            ParentMessageId = followUp.ContextMessageId,
+                            Content = followUp.Prompt,
+                            AgentName = followUp.SourceName
+                        });
+                    }
+                }
+            }
+        }
+
+        if (session.PendingQuestions.Count > 0)
+        {
+            session.Status = SessionStatus.AwaitingInput;
+        }
+        else
+        {
+            var promptConfig = await promptStore.GetAsync(ct);
+            session.Status = SessionStatus.Evaluating;
+            session.Evaluation = await EvaluateResponsesAsync(
+                [.. session.AgentResults],
+                session.Prompt,
+                promptConfig.EvaluatorPrompt,
+                copilotClient,
+                logger);
+            session.ChatHistory.Add(new ChatMessage
+            {
+                Role = "evaluator",
+                Content = $"Winner: {session.Evaluation.Winner}\n\n{session.Evaluation.Reasoning}"
+            });
+            session.Status = SessionStatus.AwaitingApproval;
+        }
+
+        await sessionStore.UpdateAsync(session, ct);
+        logger.LogInformation("Session {SessionId} answered question {QuestionId}", id, question.QuestionId);
+
+        return Results.Ok(session);
+    }
+    finally
+    {
+        sessionLock.Release();
+    }
 });
 
 // ── Session Recovery Endpoint ────────────────────────────────────────
@@ -393,6 +624,30 @@ static string GetAgentPrompt(PromptConfig config, string agentName, string defau
     return config.AgentPromptOverrides.TryGetValue(agentName, out var prompt) && !string.IsNullOrWhiteSpace(prompt)
         ? prompt
         : defaultPrompt;
+}
+
+static string? GetServiceNameForAgent(string agentName)
+{
+    if (agentName.Equals("Agent-Sonnet", StringComparison.OrdinalIgnoreCase)) return "agent-sonnet";
+    if (agentName.Equals("Agent-GptCodex", StringComparison.OrdinalIgnoreCase)) return "agent-codex";
+    if (agentName.Equals("Agent-Gpt54", StringComparison.OrdinalIgnoreCase)) return "agent-gpt54";
+    return null;
+}
+
+static string BuildAgentContinuationPrompt(string originalPrompt, string question, string answer)
+{
+    return $"""
+Original request:
+{originalPrompt}
+
+Clarification requested:
+{question}
+
+User answer:
+{answer}
+
+Please continue your previous response with this clarification and provide an updated final answer.
+""";
 }
 
 static async Task<EvaluationResult> EvaluateResponsesAsync(
@@ -582,11 +837,147 @@ static string StripCodeFences(string text)
     return s;
 }
 
+static List<UserQuestion> TryExtractUserQuestions(
+    IEnumerable<AgentResult> results,
+    IReadOnlyDictionary<string, string>? contextByAgent = null)
+{
+    // 1) Explicit marker contract (preferred):
+    //    [QUESTION] ...
+    //    [CHOICES] a|b|c
+    //    [INPUT] FreeText|SingleChoice|MultiChoice
+    // 2) Fallback natural-language detection:
+    //    last non-empty line that ends with "?" and appears to ask the user for input
+    var questions = new List<UserQuestion>();
+    foreach (var r in results.Where(r => !r.Failed))
+    {
+        var text = r.ResponseText;
+        if (string.IsNullOrWhiteSpace(text)) continue;
+
+        if (text.Contains("[QUESTION]", StringComparison.OrdinalIgnoreCase))
+        {
+            var markerQuestion = ParseMarkerQuestion(
+                text,
+                r.AgentName,
+                contextByAgent is not null && contextByAgent.TryGetValue(r.AgentName, out var markerContext) ? markerContext : null);
+            if (markerQuestion is not null)
+            {
+                questions.Add(markerQuestion);
+                continue;
+            }
+        }
+
+        var naturalQuestion = TryExtractNaturalLanguageQuestion(
+            text,
+            r.AgentName,
+            contextByAgent is not null && contextByAgent.TryGetValue(r.AgentName, out var naturalContext) ? naturalContext : null);
+        if (naturalQuestion is not null)
+        {
+            questions.Add(naturalQuestion);
+        }
+    }
+
+    return questions
+        .GroupBy(q => new
+        {
+            Source = q.SourceName?.Trim().ToLowerInvariant() ?? string.Empty,
+            Prompt = q.Prompt.Trim().ToLowerInvariant(),
+            q.InputType,
+            ChoicesKey = string.Join("|",
+                q.Choices
+                    .Select(c => c.Trim().ToLowerInvariant())
+                    .OrderBy(c => c, StringComparer.Ordinal))
+        })
+        .Select(g => g.First())
+        .ToList();
+}
+
+static UserQuestion? ParseMarkerQuestion(string text, string sourceName, string? contextMessageId)
+{
+    var qMatch = Regex.Match(text, @"\[QUESTION\]\s*(.+?)(?:\r?\n|$)", RegexOptions.IgnoreCase);
+    if (!qMatch.Success) return null;
+    var prompt = qMatch.Groups[1].Value.Trim();
+    if (string.IsNullOrWhiteSpace(prompt)) return null;
+
+    var choices = new List<string>();
+    var choicesMatch = Regex.Match(text, @"\[CHOICES\]\s*(.+?)(?:\r?\n|$)", RegexOptions.IgnoreCase);
+    if (choicesMatch.Success)
+    {
+        choices = choicesMatch.Groups[1].Value
+            .Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    var inputType = QuestionInputType.FreeText;
+    var inputMatch = Regex.Match(text, @"\[INPUT\]\s*(.+?)(?:\r?\n|$)", RegexOptions.IgnoreCase);
+    if (inputMatch.Success && Enum.TryParse<QuestionInputType>(inputMatch.Groups[1].Value.Trim(), true, out var parsed))
+    {
+        inputType = parsed;
+    }
+    else if (choices.Count > 0)
+    {
+        inputType = QuestionInputType.SingleChoice;
+    }
+
+    return new UserQuestion
+    {
+        QuestionId = $"q-{Guid.NewGuid():N}",
+        Source = "agent",
+        SourceName = sourceName,
+        Prompt = prompt,
+        ContextMessageId = contextMessageId,
+        InputType = inputType,
+        Choices = choices
+    };
+}
+
+static UserQuestion? TryExtractNaturalLanguageQuestion(string text, string sourceName, string? contextMessageId)
+{
+    var lines = text
+        .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Where(l => !l.StartsWith("Acceptance Criteria", StringComparison.OrdinalIgnoreCase))
+        .ToList();
+
+    if (lines.Count == 0) return null;
+
+    // Use last question-like line to avoid picking up earlier rhetorical lines.
+    var candidate = lines.LastOrDefault(l => l.EndsWith('?'));
+    if (string.IsNullOrWhiteSpace(candidate)) return null;
+
+    // Avoid capturing obvious non-user prompts.
+    if (candidate.Length < 8 || candidate.Length > 300) return null;
+
+    // Ask-for-input cues to reduce false positives.
+    var asksUser = Regex.IsMatch(candidate,
+        @"\b(would you|do you|can you|could you|please provide|which|what is your|choose|select|tell me)\b",
+        RegexOptions.IgnoreCase);
+    if (!asksUser) return null;
+
+    return new UserQuestion
+    {
+        QuestionId = $"q-{Guid.NewGuid():N}",
+        Source = "agent",
+        SourceName = sourceName,
+        Prompt = candidate.Trim(),
+        ContextMessageId = contextMessageId,
+        InputType = QuestionInputType.FreeText,
+        Choices = []
+    };
+}
+
 // ── Inline Types ─────────────────────────────────────────────────────
 
 public sealed record DecisionRequest
 {
     public required string Decision { get; init; } // "accept", "decline", "restart"
+}
+
+public sealed record QuestionAnswerRequest
+{
+    public required string QuestionId { get; init; }
+    public string? AnswerText { get; init; }
+    public List<string>? SelectedChoices { get; init; }
 }
 
 internal sealed record EvalJson
