@@ -14,7 +14,7 @@ import AccordionContent from 'primevue/accordioncontent'
 
 const {
   currentSession, orchestratorState, agents, isProcessing, error, acceptedResponse,
-  pendingQuestion, submitPrompt, submitDecision, submitQuestionAnswer, recoverSession, loadSessions, sessions, loadSession, resetState,
+  pendingQuestion, excludedAgents, includeAgent, includeAllAgents, submitPrompt, submitDecision, submitQuestionAnswer, recoverSession, loadSessions, sessions, loadSession, resetState,
 } = useOrchestrator()
 
 const promptInput = ref('')
@@ -32,10 +32,18 @@ const isAcceptedResponseExpanded = ref(false)
 const isResizingPanels = ref(false)
 const rightPanelWidth = ref(480)
 
-function isAwaitingQuestionForMessage(messageId?: string) {
-  if (orchestratorState.value !== 'awaiting-input' || !messageId) return false
-  return pendingQuestion.value?.contextMessageId === messageId
-}
+const pendingQuestionAnchorMessageId = computed(() => {
+  if (orchestratorState.value !== 'awaiting-input' || !pendingQuestion.value) return undefined
+  if (pendingQuestion.value.contextMessageId) return pendingQuestion.value.contextMessageId
+  if (!currentSession.value) return undefined
+
+  const source = pendingQuestion.value.sourceName || pendingQuestion.value.source
+  const latestFromSource = [...currentSession.value.chatHistory]
+    .reverse()
+    .find(m => m.role === 'agent' && m.messageId && m.agentName === source)
+
+  return latestFromSource?.messageId
+})
 
 // Auto-switch accordion panel based on orchestration state
 watch(() => orchestratorState.value, (newState) => {
@@ -311,10 +319,10 @@ onMounted(() => {
         <!-- Chat Messages -->
         <template v-if="currentSession">
           <template v-for="(msg, i) in currentSession.chatHistory" :key="i">
-            <ChatBubble :message="msg" />
+            <ChatBubble v-if="msg.role !== 'question' && msg.role !== 'answer'" :message="msg" />
 
             <!-- Inline AG-UI question response (attached to originating agent pane) -->
-            <div v-if="msg.role === 'agent' && isAwaitingQuestionForMessage(msg.messageId) && pendingQuestion" class="inline-question-card">
+            <div v-if="msg.role === 'agent' && msg.messageId === pendingQuestionAnchorMessageId && pendingQuestion" class="inline-question-card">
             <div class="question-header">
               <span class="question-title">
                 <i class="pi pi-question-circle" style="color: var(--accent-purple)"></i>
@@ -377,70 +385,6 @@ onMounted(() => {
           </div>
           </template>
 
-          <div
-            v-if="orchestratorState === 'awaiting-input' && pendingQuestion && !pendingQuestion.contextMessageId"
-            class="inline-question-card"
-          >
-            <div class="question-header">
-              <span class="question-title">
-                <i class="pi pi-question-circle" style="color: var(--accent-purple)"></i>
-                {{ pendingQuestion.sourceName || pendingQuestion.source }} needs your input
-              </span>
-              <span class="question-type">{{ pendingQuestion.inputType }}</span>
-            </div>
-            <div class="question-prompt">{{ pendingQuestion.prompt }}</div>
-            <div v-if="(currentSession?.pendingQuestions?.length ?? 0) > 1" class="question-queue-hint">
-              {{ currentSession?.pendingQuestions?.length }} questions pending
-            </div>
-
-            <div v-if="pendingQuestion.inputType === 'SingleChoice'" class="question-choices">
-              <button
-                v-for="choice in pendingQuestion.choices"
-                :key="choice"
-                :class="['choice-chip', { selected: questionChoice === choice }]"
-                :disabled="isSubmittingQuestionAnswer"
-                @click="questionChoice = choice"
-              >{{ choice }}</button>
-            </div>
-
-            <div v-else-if="pendingQuestion.inputType === 'MultiChoice'" class="question-choices">
-              <button
-                v-for="choice in pendingQuestion.choices"
-                :key="choice"
-                :class="['choice-chip', { selected: questionChoices.has(choice) }]"
-                :disabled="isSubmittingQuestionAnswer"
-                @click="toggleQuestionChoice(choice)"
-              >{{ choice }}</button>
-            </div>
-
-            <Textarea
-              v-else
-              v-model="questionAnswerText"
-              rows="3"
-              autoResize
-              class="question-input mono"
-              placeholder="Type your answer..."
-              :disabled="isSubmittingQuestionAnswer"
-            />
-
-            <div class="approval-buttons">
-              <Button
-                :label="isSubmittingQuestionAnswer ? 'Submitting...' : 'Submit Answer'"
-                icon="pi pi-check"
-                severity="success"
-                size="small"
-                @click="handleSubmitQuestionAnswer"
-                :loading="isSubmittingQuestionAnswer"
-                :disabled="
-                  isSubmittingQuestionAnswer ||
-                  (pendingQuestion.inputType === 'FreeText' && !questionAnswerText.trim()) ||
-                  (pendingQuestion.inputType === 'SingleChoice' && !questionChoice) ||
-                  (pendingQuestion.inputType === 'MultiChoice' && questionChoices.size === 0)
-                "
-              />
-              <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined :disabled="isSubmittingQuestionAnswer" @click="handleDecision('decline')" />
-            </div>
-          </div>
         </template>
 
         <!-- Error -->
@@ -465,6 +409,18 @@ onMounted(() => {
             </AccordionHeader>
             <AccordionContent>
               <OrchestratorVisualizer :agents="agents" :state="orchestratorState" />
+              <div v-if="excludedAgents.size > 0" class="excluded-agents-panel">
+                <div class="excluded-agents-header">
+                  <span>Excluded agents (auto on failure)</span>
+                  <Button label="Re-include All" size="small" severity="secondary" outlined @click="includeAllAgents" />
+                </div>
+                <div class="excluded-agent-list">
+                  <div v-for="agent in agents.filter(a => excludedAgents.has(a.name))" :key="agent.name" class="excluded-agent-item">
+                    <span class="excluded-agent-name">{{ agent.name }}</span>
+                    <Button label="Re-include" size="small" @click="includeAgent(agent.name)" />
+                  </div>
+                </div>
+              </div>
             </AccordionContent>
           </AccordionPanel>
 
@@ -908,6 +864,38 @@ onMounted(() => {
 .viz-mini-badge.awaiting-input { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
 .viz-mini-badge.awaiting-approval { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
 .viz-mini-badge.accepted { background: rgba(16,185,129,0.15); color: var(--accent-green); }
+.excluded-agents-panel {
+  margin-top: 0.75rem;
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  border-radius: 8px;
+  padding: 0.6rem;
+  background: rgba(239, 68, 68, 0.05);
+}
+.excluded-agents-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent-red);
+  margin-bottom: 0.45rem;
+}
+.excluded-agent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.excluded-agent-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.excluded-agent-name {
+  font-size: 0.75rem;
+  color: var(--text-primary);
+}
 .scores-section {
   margin-top: 0.75rem;
   border-top: 1px solid var(--border-glass);

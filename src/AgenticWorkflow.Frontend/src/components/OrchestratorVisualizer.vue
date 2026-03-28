@@ -47,11 +47,12 @@ function agentToEvalEdge(agentIndex: number) {
   const agent = props.agents[agentIndex]
   if (!agent) return { cls: 'edge-idle', color: '', glow: false }
   const isEvalPhase = props.state === 'evaluating' || props.state === 'awaiting-approval' || props.state === 'accepted'
+  const shouldAnimateDuringFanOut = props.state === 'fan-out' && props.agents.some(a => a.status === 'running')
   if (agent.status === 'winner')
     return { cls: 'edge-winner', color: 'var(--accent-amber)', glow: true }
   if (agent.status === 'complete' && isEvalPhase)
     return { cls: 'edge-done', color: 'var(--accent-green)', glow: false }
-  if (agent.status === 'complete' && props.state === 'fan-out')
+  if (agent.status === 'complete' && shouldAnimateDuringFanOut)
     return { cls: 'edge-active', color: 'var(--accent-green)', glow: true }
   if (agent.status === 'failed')
     return { cls: 'edge-failed', color: 'var(--accent-red)', glow: false }

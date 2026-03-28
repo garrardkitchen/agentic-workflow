@@ -21,14 +21,83 @@ const isProcessing = ref(false)
 const error = ref<string | null>(null)
 const acceptedResponse = ref<AcceptedResponse | null>(null)
 const pendingQuestion = ref<UserQuestion | null>(null)
+const excludedAgents = ref<Set<string>>(new Set())
 let lastSubmittedPrompt = ''
 
 export function useOrchestrator() {
+  try {
+    const raw = localStorage.getItem('excludedAgents')
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        excludedAgents.value = new Set(parsed.filter((v): v is string => typeof v === 'string'))
+      }
+    }
+  } catch {
+    excludedAgents.value = new Set()
+    localStorage.removeItem('excludedAgents')
+  }
+
+  function saveExcludedAgents() {
+    localStorage.setItem('excludedAgents', JSON.stringify(Array.from(excludedAgents.value)))
+  }
+
+  function excludeAgent(agentName: string) {
+    if (!excludedAgents.value.has(agentName)) {
+      excludedAgents.value = new Set([...excludedAgents.value, agentName])
+      saveExcludedAgents()
+    }
+  }
+
+  function includeAgent(agentName: string) {
+    if (excludedAgents.value.has(agentName)) {
+      const next = new Set(excludedAgents.value)
+      next.delete(agentName)
+      excludedAgents.value = next
+      saveExcludedAgents()
+    }
+  }
+
+  function includeAllAgents() {
+    if (excludedAgents.value.size > 0) {
+      excludedAgents.value = new Set()
+      saveExcludedAgents()
+    }
+  }
+
+  function serviceNameForAgent(agentName: string): string {
+    if (agentName === 'Agent-Sonnet') return 'agent-sonnet'
+    if (agentName === 'Agent-GptCodex') return 'agent-codex'
+    if (agentName === 'Agent-Gpt54') return 'agent-gpt54'
+    return agentName.toLowerCase()
+  }
+
+  function mergePendingQuestions(base: UserQuestion[] = [], incoming: UserQuestion[] = []): UserQuestion[] {
+    const merged = [...base]
+    for (const q of incoming) {
+      const exists = merged.some(existing => existing.questionId === q.questionId)
+      if (!exists) merged.push(q)
+    }
+    return merged
+  }
+
   async function submitPrompt(prompt: string, systemPromptOverride?: string) {
     isProcessing.value = true
     error.value = null
     orchestratorState.value = 'fan-out'
-    agents.forEach(a => { a.status = 'running'; a.elapsedMs = undefined })
+    const excluded = excludedAgents.value
+    const includedAgents = agents.filter(a => !excluded.has(a.name))
+    if (includedAgents.length === 0) {
+      error.value = 'All agents are excluded. Re-include at least one agent to run.'
+      orchestratorState.value = 'idle'
+      isProcessing.value = false
+      return
+    }
+
+    agents.forEach(a => {
+      a.status = excluded.has(a.name) ? 'failed' : 'running'
+      a.elapsedMs = undefined
+    })
     lastSubmittedPrompt = prompt
 
     // Show user message immediately in chat
@@ -57,6 +126,9 @@ export function useOrchestrator() {
           prompt,
           sessionId: '',
           systemPromptOverride,
+          metadata: {
+            excludedAgents: Array.from(excluded).map(a => serviceNameForAgent(a)).join(','),
+          },
         }),
       })
 
@@ -107,7 +179,7 @@ export function useOrchestrator() {
         } else if (event.status === 'AwaitingApproval') {
           orchestratorState.value = 'awaiting-approval'
         } else if (event.status === 'Failed') {
-          orchestratorState.value = 'idle'
+          orchestratorState.value = 'failed'
           agents.forEach(a => { if (a.status === 'running') a.status = 'failed' })
         }
         if (event.sessionId && currentSession.value) {
@@ -136,6 +208,9 @@ export function useOrchestrator() {
           if (agent) {
             agent.status = event.agentResult.failed ? 'failed' : 'complete'
             agent.elapsedMs = event.agentResult.elapsedMs
+            if (event.agentResult.failed) {
+              excludeAgent(agent.name)
+            }
           }
           if (currentSession.value) {
             currentSession.value.agentResults.push(event.agentResult)
@@ -233,25 +308,23 @@ export function useOrchestrator() {
           orchestratorState.value = 'awaiting-input'
           if (currentSession.value) {
             currentSession.value.status = 'AwaitingInput'
-            const queue = currentSession.value.pendingQuestions ?? []
-            const exists = queue.some(q => q.questionId === event.question!.questionId)
-            if (!exists) queue.push(event.question)
+            const queue = mergePendingQuestions(currentSession.value.pendingQuestions ?? [], [event.question])
             currentSession.value.pendingQuestions = queue
             if (!pendingQuestion.value) {
               pendingQuestion.value = queue[0] ?? null
             }
           }
-          currentSession.value?.chatHistory.push({
-            role: 'question',
-            parentMessageId: event.question.contextMessageId,
-            content: event.question.prompt,
-            agentName: event.question.sourceName || event.question.source,
-            timestamp: event.timestamp,
-          })
         }
         break
 
       case 'error':
+        if (event.content) {
+          error.value = event.content
+        }
+        if (event.status === 'Failed') {
+          orchestratorState.value = 'failed'
+          agents.forEach(a => { if (a.status === 'running') a.status = 'failed' })
+        }
         if (event.agentName) {
           const normalizedAgentName = event.agentName.startsWith('agent-')
             ? event.agentName === 'agent-sonnet'
@@ -263,7 +336,10 @@ export function useOrchestrator() {
                   : event.agentName
             : event.agentName
           const agent = agents.find(a => a.name === normalizedAgentName)
-          if (agent) agent.status = 'failed'
+          if (agent) {
+            agent.status = 'failed'
+            excludeAgent(agent.name)
+          }
         }
         break
     }
@@ -377,9 +453,17 @@ export function useOrchestrator() {
       }
 
       const updated: SessionState = await response.json()
-      currentSession.value = updated
+      const existingQueue = currentSession.value?.pendingQuestions ?? []
+      const answeredQuestionId = questionId
+      const mergedQueue = mergePendingQuestions(existingQueue, updated.pendingQuestions ?? [])
+        .filter(q => q.questionId !== answeredQuestionId)
 
-      const remaining = updated.pendingQuestions ?? []
+      currentSession.value = {
+        ...updated,
+        pendingQuestions: mergedQueue,
+      }
+
+      const remaining = mergedQueue
       pendingQuestion.value = remaining[0] ?? null
       orchestratorState.value = pendingQuestion.value
         ? 'awaiting-input'
@@ -387,7 +471,9 @@ export function useOrchestrator() {
           ? 'awaiting-approval'
           : updated.status === 'Failed'
             ? 'failed'
-            : 'fan-out'
+            : updated.status === 'Evaluating'
+              ? 'evaluating'
+              : 'idle'
 
       if (pendingQuestion.value) {
         // More questions remain; do not restart orchestration yet.
@@ -513,6 +599,9 @@ export function useOrchestrator() {
     error,
     acceptedResponse,
     pendingQuestion,
+    excludedAgents,
+    includeAgent,
+    includeAllAgents,
     submitPrompt,
     submitDecision,
     submitQuestionAnswer,

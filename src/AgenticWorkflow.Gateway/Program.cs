@@ -133,7 +133,37 @@ app.MapPost("/api/orchestrate", async (
         Status = SessionStatus.AgentsRunning
     }, jsonOptions, sseLock);
 
-    var agentNames = new[] { "agent-sonnet", "agent-codex", "agent-gpt54" };
+    var allAgentNames = new[] { "agent-sonnet", "agent-codex", "agent-gpt54" };
+    var excludedAgentsCsv = request.Metadata is not null &&
+                            request.Metadata.TryGetValue("excludedAgents", out var excludedValue)
+        ? excludedValue
+        : null;
+    var excludedAgents = (excludedAgentsCsv ?? string.Empty)
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var agentNames = allAgentNames
+        .Where(name => !excludedAgents.Contains(name))
+        .ToArray();
+
+    if (agentNames.Length == 0)
+    {
+        session.Status = SessionStatus.Failed;
+        session.ChatHistory.Add(new ChatMessage
+        {
+            Role = "system",
+            Content = "All agents are excluded from this run."
+        });
+        await sessionStore.UpdateAsync(session, ct);
+
+        await SendEvent(httpContext, new StreamEvent
+        {
+            Type = "error",
+            SessionId = sessionId,
+            Content = "All agents are excluded from this run.",
+            Status = SessionStatus.Failed
+        }, jsonOptions, sseLock);
+        return;
+    }
     var emittedQuestionKeys = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
     var emittedQuestionsByKey = new ConcurrentDictionary<string, UserQuestion>(StringComparer.OrdinalIgnoreCase);
     using var questionStateLock = new SemaphoreSlim(1, 1);
@@ -642,6 +672,13 @@ app.MapPost("/api/sessions/{id}/answer", async (
     CancellationToken ct) =>
 {
     var sessionLock = sessionMutationLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+    string? continuationServiceName = null;
+    string? continuationPrompt = null;
+    string? continuationAgentPrompt = null;
+    string? answeredQuestionContextMessageId = null;
+    string? answeredQuestionSourceName = null;
+    string? originalPrompt = null;
+
     await sessionLock.WaitAsync(ct);
     try
     {
@@ -704,66 +741,25 @@ app.MapPost("/api/sessions/{id}/answer", async (
 
             var promptConfig = await promptStore.GetAsync(ct);
             var defaultPrompt = session.SystemPrompt ?? promptConfig.DrivingSystemPrompt;
-            var agentPrompt = GetAgentPrompt(promptConfig, serviceName, defaultPrompt);
-            var continuationPrompt = BuildAgentContinuationPrompt(session.Prompt, question.Prompt, renderedAnswer);
-
-            var client = httpClientFactory.CreateClient(serviceName);
-            var continuationRequest = new AgentRequest
-            {
-                Prompt = continuationPrompt,
-                SessionId = session.Id,
-                SystemPromptOverride = agentPrompt
-            };
-
-            var continuationResponse = await client.PostAsJsonAsync("/api/run", continuationRequest, ct);
-            continuationResponse.EnsureSuccessStatusCode();
-            var updatedResult = await continuationResponse.Content.ReadFromJsonAsync<AgentResult>(ct);
-            if (updatedResult is not null)
-            {
-                var existing = session.AgentResults.FindIndex(r => r.AgentName == updatedResult.AgentName);
-                if (existing >= 0) session.AgentResults[existing] = updatedResult;
-                else session.AgentResults.Add(updatedResult);
-
-                session.ChatHistory.Add(new ChatMessage
-                {
-                    Role = "agent",
-                    MessageId = $"m-{Guid.NewGuid():N}",
-                    ParentMessageId = question.ContextMessageId,
-                    Content = updatedResult.ResponseText,
-                    AgentName = updatedResult.AgentName
-                });
-                var contextMessageId = session.ChatHistory.Last().MessageId;
-
-                var contextByAgent = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                if (!string.IsNullOrWhiteSpace(contextMessageId))
-                {
-                    contextByAgent[updatedResult.AgentName] = contextMessageId;
-                }
-
-                var followUps = TryExtractUserQuestions([updatedResult], contextByAgent);
-                foreach (var followUp in followUps)
-                {
-                    var duplicatePending = session.PendingQuestions.Any(p =>
-                        string.Equals(p.SourceName, followUp.SourceName, StringComparison.OrdinalIgnoreCase) &&
-                        string.Equals(p.Prompt.Trim(), followUp.Prompt.Trim(), StringComparison.OrdinalIgnoreCase));
-                    if (!duplicatePending)
-                    {
-                        session.PendingQuestions.Add(followUp);
-                        session.ChatHistory.Add(new ChatMessage
-                        {
-                            Role = "question",
-                            ParentMessageId = followUp.ContextMessageId,
-                            Content = followUp.Prompt,
-                            AgentName = followUp.SourceName
-                        });
-                    }
-                }
-            }
+            continuationServiceName = serviceName;
+            continuationAgentPrompt = GetAgentPrompt(promptConfig, serviceName, defaultPrompt);
+            continuationPrompt = BuildAgentContinuationPrompt(session.Prompt, question.Prompt, renderedAnswer);
+            answeredQuestionContextMessageId = question.ContextMessageId;
+            answeredQuestionSourceName = question.SourceName;
+            originalPrompt = session.Prompt;
         }
+
+        var hasAsyncContinuation = !string.IsNullOrWhiteSpace(continuationServiceName) &&
+                                   !string.IsNullOrWhiteSpace(continuationPrompt);
 
         if (session.PendingQuestions.Count > 0)
         {
             session.Status = SessionStatus.AwaitingInput;
+        }
+        else if (hasAsyncContinuation)
+        {
+            // Return immediately and finish continuation/evaluation in background.
+            session.Status = SessionStatus.AgentsRunning;
         }
         else
         {
@@ -798,6 +794,124 @@ app.MapPost("/api/sessions/{id}/answer", async (
 
         await sessionStore.UpdateAsync(session, ct);
         logger.LogInformation("Session {SessionId} answered question {QuestionId}", id, question.QuestionId);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                AgentResult? updatedResult = null;
+                if (!string.IsNullOrWhiteSpace(continuationServiceName) &&
+                    !string.IsNullOrWhiteSpace(continuationPrompt))
+                {
+                    var client = httpClientFactory.CreateClient(continuationServiceName);
+                    var continuationRequest = new AgentRequest
+                    {
+                        Prompt = continuationPrompt,
+                        SessionId = id,
+                        SystemPromptOverride = continuationAgentPrompt
+                    };
+
+                    using var continuationResponse = await client.PostAsJsonAsync("/api/run", continuationRequest, CancellationToken.None);
+                    continuationResponse.EnsureSuccessStatusCode();
+                    updatedResult = await continuationResponse.Content.ReadFromJsonAsync<AgentResult>(CancellationToken.None);
+                }
+
+                var bgLock = sessionMutationLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+                await bgLock.WaitAsync(CancellationToken.None);
+                try
+                {
+                    var current = await sessionStore.GetAsync(id, CancellationToken.None);
+                    if (current is null) return;
+
+                    if (updatedResult is not null)
+                    {
+                        var existing = current.AgentResults.FindIndex(r => r.AgentName == updatedResult.AgentName);
+                        if (existing >= 0) current.AgentResults[existing] = updatedResult;
+                        else current.AgentResults.Add(updatedResult);
+
+                        current.ChatHistory.Add(new ChatMessage
+                        {
+                            Role = "agent",
+                            MessageId = $"m-{Guid.NewGuid():N}",
+                            ParentMessageId = answeredQuestionContextMessageId,
+                            Content = updatedResult.ResponseText,
+                            AgentName = updatedResult.AgentName
+                        });
+                        var contextMessageId = current.ChatHistory.Last().MessageId;
+
+                        var contextByAgent = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        if (!string.IsNullOrWhiteSpace(contextMessageId))
+                        {
+                            contextByAgent[updatedResult.AgentName] = contextMessageId;
+                        }
+
+                        var followUps = TryExtractUserQuestions([updatedResult], contextByAgent);
+                        foreach (var followUp in followUps)
+                        {
+                            var duplicatePending = current.PendingQuestions.Any(p =>
+                                string.Equals(p.SourceName, followUp.SourceName, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(p.Prompt.Trim(), followUp.Prompt.Trim(), StringComparison.OrdinalIgnoreCase));
+                            if (!duplicatePending)
+                            {
+                                current.PendingQuestions.Add(followUp);
+                                current.ChatHistory.Add(new ChatMessage
+                                {
+                                    Role = "question",
+                                    ParentMessageId = followUp.ContextMessageId,
+                                    Content = followUp.Prompt,
+                                    AgentName = followUp.SourceName
+                                });
+                            }
+                        }
+                    }
+
+                    if (current.PendingQuestions.Count > 0)
+                    {
+                        current.Status = SessionStatus.AwaitingInput;
+                    }
+                    else
+                    {
+                        var promptConfig = await promptStore.GetAsync(CancellationToken.None);
+                        current.Status = SessionStatus.Evaluating;
+                        var evaluationCandidates = current.AgentResults.Where(r => !r.Failed).ToArray();
+                        if (evaluationCandidates.Length == 0)
+                        {
+                            current.Status = SessionStatus.Failed;
+                            current.ChatHistory.Add(new ChatMessage
+                            {
+                                Role = "system",
+                                Content = "No successful agent responses available for evaluation."
+                            });
+                        }
+                        else
+                        {
+                            current.Evaluation = await EvaluateResponsesAsync(
+                                evaluationCandidates,
+                                originalPrompt ?? current.Prompt,
+                                promptConfig.EvaluatorPrompt,
+                                copilotClient,
+                                logger);
+                            current.ChatHistory.Add(new ChatMessage
+                            {
+                                Role = "evaluator",
+                                Content = $"Winner: {current.Evaluation.Winner}\n\n{current.Evaluation.Reasoning}"
+                            });
+                            current.Status = SessionStatus.AwaitingApproval;
+                        }
+                    }
+
+                    await sessionStore.UpdateAsync(current, CancellationToken.None);
+                }
+                finally
+                {
+                    bgLock.Release();
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Async continuation failed for session {SessionId}", id);
+            }
+        });
 
         return Results.Ok(session);
     }
