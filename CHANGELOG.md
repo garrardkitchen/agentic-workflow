@@ -26,6 +26,9 @@ All notable changes to this project will be documented in this file.
 - Added a draggable divider between chat and right pane so either side can be resized live.
 - Failed agents are now excluded from chat response bubbles and consistently shown as red in orchestration status.
 - Gateway agent call timeout reduced to fail faster when one model is unresponsive.
+- Question prompts now stay anchored to their original agent card, and answer submission no longer blocks follow-up prompts while async continuation/evaluation progresses.
+- Inline question prompts now render on each originating agent card concurrently, with per-question draft state and immediate per-card submit handling.
+- Session refresh after answer now preserves chat history safely without cross-session contamination and keeps pending-question state aligned to backend truth.
 
 ## 2026-03-28
 

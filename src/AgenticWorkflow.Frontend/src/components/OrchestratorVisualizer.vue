@@ -144,11 +144,15 @@ function edgeTo(pos: { x: number; y: number }) {
         <rect :width="nodeW" :height="nodeH" :rx="nodeR" fill="var(--bg-secondary)"
           :stroke="statusColor(agent.status)" stroke-width="2.5"
           :class="{ 'animate-pulse-glow': agent.status === 'running' }" />
-        <text :x="nodeW/2" :y="nodeH/2 - 7" text-anchor="middle" dominant-baseline="middle"
+        <text :x="nodeW/2" :y="nodeH/2 - 14" text-anchor="middle" dominant-baseline="middle"
+          :fill="statusColor(agent.status)" font-size="10">
+          🤖
+        </text>
+        <text :x="nodeW/2" :y="nodeH/2 - 2" text-anchor="middle" dominant-baseline="middle"
           :fill="statusColor(agent.status)" font-size="10" font-weight="600">
           {{ agent.name.replace('Agent-', '') }}
         </text>
-        <text :x="nodeW/2" :y="nodeH/2 + 7" text-anchor="middle" dominant-baseline="middle"
+        <text :x="nodeW/2" :y="nodeH/2 + 11" text-anchor="middle" dominant-baseline="middle"
           fill="var(--text-secondary)" font-size="8" class="mono">
           {{ agent.model }}
         </text>

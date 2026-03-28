@@ -4,6 +4,7 @@ import { useOrchestrator } from '../composables/useOrchestrator'
 import OrchestratorVisualizer from '../components/OrchestratorVisualizer.vue'
 import ChatBubble from '../components/ChatBubble.vue'
 import { renderMarkdown } from '../utils/markdown'
+import type { ChatMessage, UserQuestion } from '../types'
 import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
 import Textarea from 'primevue/textarea'
@@ -14,7 +15,7 @@ import AccordionContent from 'primevue/accordioncontent'
 
 const {
   currentSession, orchestratorState, agents, isProcessing, error, acceptedResponse,
-  pendingQuestion, excludedAgents, includeAgent, includeAllAgents, submitPrompt, submitDecision, submitQuestionAnswer, recoverSession, loadSessions, sessions, loadSession, resetState,
+  excludedAgents, includeAgent, includeAllAgents, submitPrompt, submitDecision, submitQuestionAnswer, recoverSession, loadSessions, sessions, loadSession, resetState,
 } = useOrchestrator()
 
 const promptInput = ref('')
@@ -24,26 +25,88 @@ const chatContainer = ref<HTMLElement>()
 const expandedAgents = ref<Set<string>>(new Set())
 const copySuccess = ref(false)
 const activePanel = ref<string | null>('orchestration')
-const questionAnswerText = ref('')
-const questionChoice = ref('')
-const questionChoices = ref<Set<string>>(new Set())
-const isSubmittingQuestionAnswer = ref(false)
+const questionAnswerTextById = ref<Record<string, string>>({})
+const questionChoiceById = ref<Record<string, string>>({})
+const questionChoicesById = ref<Record<string, string[]>>({})
+const submittingQuestionIds = ref<Set<string>>(new Set())
+const isSubmittingAnyQuestion = computed(() => submittingQuestionIds.value.size > 0)
 const isAcceptedResponseExpanded = ref(false)
 const isResizingPanels = ref(false)
 const rightPanelWidth = ref(480)
 
-const pendingQuestionAnchorMessageId = computed(() => {
-  if (orchestratorState.value !== 'awaiting-input' || !pendingQuestion.value) return undefined
-  if (pendingQuestion.value.contextMessageId) return pendingQuestion.value.contextMessageId
+function getQuestionAnchorMessageId(question: UserQuestion): string | undefined {
+  if (question.contextMessageId) return question.contextMessageId
   if (!currentSession.value) return undefined
-
-  const source = pendingQuestion.value.sourceName || pendingQuestion.value.source
+  const source = question.sourceName || question.source
   const latestFromSource = [...currentSession.value.chatHistory]
     .reverse()
     .find(m => m.role === 'agent' && m.messageId && m.agentName === source)
-
   return latestFromSource?.messageId
+}
+
+const pendingQuestionsByMessageId = computed(() => {
+  const grouped = new Map<string, UserQuestion[]>()
+  const pending = currentSession.value?.pendingQuestions ?? []
+  for (const question of pending) {
+    const anchorId = getQuestionAnchorMessageId(question)
+    if (!anchorId) continue
+    const list = grouped.get(anchorId) ?? []
+    list.push(question)
+    grouped.set(anchorId, list)
+  }
+  return grouped
 })
+
+function inlineQuestionsForMessage(message: ChatMessage): UserQuestion[] {
+  if (message.role !== 'agent' || !message.messageId) return []
+  return pendingQuestionsByMessageId.value.get(message.messageId) ?? []
+}
+
+function isQuestionSubmitting(questionId: string): boolean {
+  return submittingQuestionIds.value.has(questionId)
+}
+
+function setQuestionAnswerText(questionId: string, value: string) {
+  questionAnswerTextById.value = {
+    ...questionAnswerTextById.value,
+    [questionId]: value,
+  }
+}
+
+function setQuestionChoice(questionId: string, choice: string) {
+  questionChoiceById.value = {
+    ...questionChoiceById.value,
+    [questionId]: choice,
+  }
+}
+
+function toggleQuestionChoice(questionId: string, choice: string) {
+  const existing = new Set(questionChoicesById.value[questionId] ?? [])
+  if (existing.has(choice)) existing.delete(choice)
+  else existing.add(choice)
+  questionChoicesById.value = {
+    ...questionChoicesById.value,
+    [questionId]: Array.from(existing),
+  }
+}
+
+function clearQuestionDraftState(questionId: string) {
+  const nextText = { ...questionAnswerTextById.value }
+  const nextSingle = { ...questionChoiceById.value }
+  const nextMulti = { ...questionChoicesById.value }
+  delete nextText[questionId]
+  delete nextSingle[questionId]
+  delete nextMulti[questionId]
+  questionAnswerTextById.value = nextText
+  questionChoiceById.value = nextSingle
+  questionChoicesById.value = nextMulti
+}
+
+function canSubmitQuestion(question: UserQuestion): boolean {
+  if (question.inputType === 'SingleChoice') return !!questionChoiceById.value[question.questionId]
+  if (question.inputType === 'MultiChoice') return (questionChoicesById.value[question.questionId]?.length ?? 0) > 0
+  return !!questionAnswerTextById.value[question.questionId]?.trim()
+}
 
 // Auto-switch accordion panel based on orchestration state
 watch(() => orchestratorState.value, (newState) => {
@@ -110,13 +173,13 @@ async function handleSubmit() {
 }
 
 async function handleDecision(d: 'accept' | 'decline' | 'restart') {
-  if (d === 'decline' && isSubmittingQuestionAnswer.value) return
+  if (d === 'decline' && submittingQuestionIds.value.size > 0) return
   if (!currentSession.value) return
   await submitDecision(currentSession.value.id, d)
   if (d === 'decline') {
-    questionAnswerText.value = ''
-    questionChoice.value = ''
-    questionChoices.value = new Set()
+    questionAnswerTextById.value = {}
+    questionChoiceById.value = {}
+    questionChoicesById.value = {}
   }
 }
 
@@ -129,39 +192,38 @@ async function handleRecover() {
   await submitPrompt(prompt)
 }
 
-function toggleQuestionChoice(choice: string) {
-  const next = new Set(questionChoices.value)
-  if (next.has(choice)) next.delete(choice)
-  else next.add(choice)
-  questionChoices.value = next
-}
-
-async function handleSubmitQuestionAnswer() {
-  if (isSubmittingQuestionAnswer.value) return
-  if (!currentSession.value || !pendingQuestion.value) return
-  const q = pendingQuestion.value
-  if (q.inputType === 'SingleChoice' && !questionChoice.value) return
-  if (q.inputType === 'MultiChoice' && questionChoices.value.size === 0) return
-  if (q.inputType === 'FreeText' && !questionAnswerText.value.trim()) return
+async function handleSubmitQuestionAnswer(question: UserQuestion) {
+  if (!currentSession.value) return
+  if (isSubmittingAnyQuestion.value) return
+  if (isQuestionSubmitting(question.questionId)) return
+  if (!canSubmitQuestion(question)) return
 
   const selectedChoices =
-    q.inputType === 'SingleChoice'
-      ? [questionChoice.value]
-      : q.inputType === 'MultiChoice'
-        ? Array.from(questionChoices.value)
+    question.inputType === 'SingleChoice'
+      ? [questionChoiceById.value[question.questionId]]
+      : question.inputType === 'MultiChoice'
+        ? (questionChoicesById.value[question.questionId] ?? [])
         : []
 
-  const answerText = q.inputType === 'FreeText' ? questionAnswerText.value.trim() : ''
-  isSubmittingQuestionAnswer.value = true
+  const answerText = question.inputType === 'FreeText'
+    ? (questionAnswerTextById.value[question.questionId] ?? '').trim()
+    : ''
+
+  submittingQuestionIds.value = new Set([...submittingQuestionIds.value, question.questionId])
   try {
-    const submitted = await submitQuestionAnswer(currentSession.value.id, q.questionId, answerText, selectedChoices)
+    const submitted = await submitQuestionAnswer(
+      currentSession.value.id,
+      question.questionId,
+      answerText,
+      selectedChoices,
+    )
     if (submitted) {
-      questionAnswerText.value = ''
-      questionChoice.value = ''
-      questionChoices.value = new Set()
+      clearQuestionDraftState(question.questionId)
     }
   } finally {
-    isSubmittingQuestionAnswer.value = false
+    const next = new Set(submittingQuestionIds.value)
+    next.delete(question.questionId)
+    submittingQuestionIds.value = next
   }
 }
 
@@ -319,70 +381,87 @@ onMounted(() => {
         <!-- Chat Messages -->
         <template v-if="currentSession">
           <template v-for="(msg, i) in currentSession.chatHistory" :key="i">
-            <ChatBubble v-if="msg.role !== 'question' && msg.role !== 'answer'" :message="msg" />
+            <ChatBubble
+              v-if="msg.role !== 'question' && msg.role !== 'answer'"
+              :message="msg"
+              :showPromptInline="inlineQuestionsForMessage(msg).length > 0"
+            >
+              <template #promptInline>
+                <div
+                  v-for="question in inlineQuestionsForMessage(msg)"
+                  :key="question.questionId"
+                  class="inline-question-card"
+                >
+                  <div class="question-header">
+                    <span class="question-title">
+                      <i class="pi pi-question-circle" style="color: var(--accent-purple)"></i>
+                      {{ question.sourceName || question.source }} needs your input
+                    </span>
+                    <span class="question-type">{{ question.inputType }}</span>
+                  </div>
+                  <div class="question-prompt">{{ question.prompt }}</div>
+                  <div v-if="(currentSession?.pendingQuestions?.length ?? 0) > 1" class="question-queue-hint">
+                    {{ currentSession?.pendingQuestions?.length }} questions pending
+                  </div>
 
-            <!-- Inline AG-UI question response (attached to originating agent pane) -->
-            <div v-if="msg.role === 'agent' && msg.messageId === pendingQuestionAnchorMessageId && pendingQuestion" class="inline-question-card">
-            <div class="question-header">
-              <span class="question-title">
-                <i class="pi pi-question-circle" style="color: var(--accent-purple)"></i>
-                {{ pendingQuestion.sourceName || pendingQuestion.source }} needs your input
-              </span>
-              <span class="question-type">{{ pendingQuestion.inputType }}</span>
-            </div>
-            <div class="question-prompt">{{ pendingQuestion.prompt }}</div>
-            <div v-if="(currentSession?.pendingQuestions?.length ?? 0) > 1" class="question-queue-hint">
-              {{ currentSession?.pendingQuestions?.length }} questions pending
-            </div>
+                  <div v-if="question.inputType === 'SingleChoice'" class="question-choices">
+                    <button
+                      v-for="choice in question.choices"
+                      :key="choice"
+                      :class="['choice-chip', { selected: questionChoiceById[question.questionId] === choice }]"
+                      :disabled="isSubmittingAnyQuestion"
+                      @click="setQuestionChoice(question.questionId, choice)"
+                    >{{ choice }}</button>
+                  </div>
 
-            <div v-if="pendingQuestion.inputType === 'SingleChoice'" class="question-choices">
-              <button
-                v-for="choice in pendingQuestion.choices"
-                :key="choice"
-                :class="['choice-chip', { selected: questionChoice === choice }]"
-                :disabled="isSubmittingQuestionAnswer"
-                @click="questionChoice = choice"
-              >{{ choice }}</button>
-            </div>
+                  <div v-else-if="question.inputType === 'MultiChoice'" class="question-choices">
+                    <button
+                      v-for="choice in question.choices"
+                      :key="choice"
+                      :class="['choice-chip', { selected: (questionChoicesById[question.questionId] ?? []).includes(choice) }]"
+                      :disabled="isSubmittingAnyQuestion"
+                      @click="toggleQuestionChoice(question.questionId, choice)"
+                    >{{ choice }}</button>
+                  </div>
 
-            <div v-else-if="pendingQuestion.inputType === 'MultiChoice'" class="question-choices">
-              <button
-                v-for="choice in pendingQuestion.choices"
-                :key="choice"
-                :class="['choice-chip', { selected: questionChoices.has(choice) }]"
-                :disabled="isSubmittingQuestionAnswer"
-                @click="toggleQuestionChoice(choice)"
-              >{{ choice }}</button>
-            </div>
+                  <Textarea
+                    v-else
+                    :modelValue="questionAnswerTextById[question.questionId] ?? ''"
+                    @update:modelValue="setQuestionAnswerText(question.questionId, String($event ?? ''))"
+                    rows="3"
+                    autoResize
+                    class="question-input mono"
+                    placeholder="Type your answer..."
+                    :disabled="isSubmittingAnyQuestion"
+                  />
 
-            <Textarea
-              v-else
-              v-model="questionAnswerText"
-              rows="3"
-              autoResize
-              class="question-input mono"
-              placeholder="Type your answer..."
-              :disabled="isSubmittingQuestionAnswer"
-            />
-
-            <div class="approval-buttons">
-              <Button
-                :label="isSubmittingQuestionAnswer ? 'Submitting...' : 'Submit Answer'"
-                icon="pi pi-check"
-                severity="success"
-                size="small"
-                @click="handleSubmitQuestionAnswer"
-                :loading="isSubmittingQuestionAnswer"
-                :disabled="
-                  isSubmittingQuestionAnswer ||
-                  (pendingQuestion.inputType === 'FreeText' && !questionAnswerText.trim()) ||
-                  (pendingQuestion.inputType === 'SingleChoice' && !questionChoice) ||
-                  (pendingQuestion.inputType === 'MultiChoice' && questionChoices.size === 0)
-                "
-              />
-              <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined :disabled="isSubmittingQuestionAnswer" @click="handleDecision('decline')" />
-            </div>
-          </div>
+                  <div class="approval-buttons">
+                    <Button
+                      :label="isQuestionSubmitting(question.questionId) ? 'Submitting...' : 'Submit Answer'"
+                      icon="pi pi-check"
+                      severity="success"
+                      size="small"
+                      @click="handleSubmitQuestionAnswer(question)"
+                      :loading="isQuestionSubmitting(question.questionId)"
+                      :disabled="
+                        isSubmittingAnyQuestion ||
+                        !canSubmitQuestion(question)
+                      "
+                    />
+                    <Button
+                      v-if="currentSession?.pendingQuestions?.[0]?.questionId === question.questionId"
+                      label="Cancel"
+                      icon="pi pi-times"
+                      severity="secondary"
+                      size="small"
+                      outlined
+                      :disabled="isSubmittingAnyQuestion"
+                      @click="handleDecision('decline')"
+                    />
+                  </div>
+                </div>
+              </template>
+            </ChatBubble>
           </template>
 
         </template>

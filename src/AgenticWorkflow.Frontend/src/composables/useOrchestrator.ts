@@ -7,6 +7,8 @@ import type {
   PromptConfig,
   AcceptedResponse,
   UserQuestion,
+  ChatMessage,
+  AgentResult,
 } from '../types'
 
 const sessions = ref<SessionState[]>([])
@@ -20,7 +22,6 @@ const agents = reactive<AgentNode[]>([
 const isProcessing = ref(false)
 const error = ref<string | null>(null)
 const acceptedResponse = ref<AcceptedResponse | null>(null)
-const pendingQuestion = ref<UserQuestion | null>(null)
 const excludedAgents = ref<Set<string>>(new Set())
 let lastSubmittedPrompt = ''
 
@@ -79,6 +80,112 @@ export function useOrchestrator() {
       if (!exists) merged.push(q)
     }
     return merged
+  }
+
+  function mergeAgentResults(base: AgentResult[] = [], incoming: AgentResult[] = []): AgentResult[] {
+    const byAgent = new Map<string, AgentResult>()
+    for (const item of base) byAgent.set(item.agentName, item)
+    for (const item of incoming) byAgent.set(item.agentName, item)
+    return Array.from(byAgent.values())
+  }
+
+  function messageKey(msg: ChatMessage): string {
+    if (msg.messageId) return `id:${msg.messageId}`
+    return `fallback:${msg.role}|${msg.agentName ?? ''}|${msg.parentMessageId ?? ''}|${msg.timestamp ?? ''}`
+  }
+
+  function mergeChatHistory(base: ChatMessage[] = [], incoming: ChatMessage[] = []): ChatMessage[] {
+    const merged = [...base]
+    const keyToIndex = new Map<string, number>()
+
+    merged.forEach((msg, index) => {
+      keyToIndex.set(messageKey(msg), index)
+    })
+
+    for (const msg of incoming) {
+      const key = messageKey(msg)
+      const existingIndex = keyToIndex.get(key)
+      if (existingIndex === undefined) {
+        keyToIndex.set(key, merged.length)
+        merged.push(msg)
+      } else {
+        merged[existingIndex] = {
+          ...merged[existingIndex],
+          ...msg,
+        }
+      }
+    }
+
+    return merged
+  }
+
+  async function syncSessionState(sessionId: string): Promise<SessionState | null> {
+    const res = await fetch(`/api/sessions/${sessionId}`)
+    if (!res.ok) return null
+    const loaded: SessionState | null = await res.json()
+    if (!loaded) return null
+    return loaded
+  }
+
+  function applySessionState(loaded: SessionState) {
+    const existingSession = currentSession.value
+    const sameSession = !!existingSession?.id && existingSession.id === loaded.id
+    const mergedHistory = sameSession
+      ? mergeChatHistory(existingSession?.chatHistory ?? [], loaded.chatHistory ?? [])
+      : (loaded.chatHistory ?? [])
+    const mergedAgentResults = sameSession
+      ? mergeAgentResults(existingSession?.agentResults ?? [], loaded.agentResults ?? [])
+      : (loaded.agentResults ?? [])
+    const nextPendingQuestions = loaded.pendingQuestions ?? []
+
+    currentSession.value = {
+      ...loaded,
+      chatHistory: mergedHistory,
+      agentResults: mergedAgentResults,
+      pendingQuestions: nextPendingQuestions,
+    }
+
+    switch (loaded.status) {
+      case 'AgentsRunning':
+        orchestratorState.value = 'fan-out'
+        break
+      case 'Evaluating':
+        orchestratorState.value = 'evaluating'
+        agents.forEach(a => { if (a.status === 'running') a.status = 'complete' })
+        break
+      case 'AwaitingInput':
+        orchestratorState.value = 'awaiting-input'
+        break
+      case 'AwaitingApproval':
+        orchestratorState.value = 'awaiting-approval'
+        if (loaded.evaluation) {
+          const winnerAgent = agents.find(a => a.name === loaded.evaluation!.winner)
+          if (winnerAgent) winnerAgent.status = 'winner'
+        }
+        break
+      case 'Accepted':
+        orchestratorState.value = 'accepted'
+        break
+      case 'Failed':
+        orchestratorState.value = 'failed'
+        break
+      default:
+        orchestratorState.value = 'idle'
+        break
+    }
+  }
+
+  async function pollSessionUntilProgress(sessionId: string, attempts = 30, delayMs = 400): Promise<void> {
+    for (let i = 0; i < attempts; i++) {
+      const loaded = await syncSessionState(sessionId)
+      if (!loaded) return
+      applySessionState(loaded)
+
+      if ((loaded.pendingQuestions?.length ?? 0) > 0) return
+      if (loaded.status === 'AwaitingApproval' || loaded.status === 'Failed' || loaded.status === 'Accepted') return
+
+      await new Promise(resolve => setTimeout(resolve, delayMs))
+    }
   }
 
   async function submitPrompt(prompt: string, systemPromptOverride?: string) {
@@ -274,7 +381,6 @@ export function useOrchestrator() {
 
       case 'evaluation':
         if (event.evaluation) {
-          pendingQuestion.value = null
           orchestratorState.value = 'awaiting-approval'
           if (currentSession.value) {
             currentSession.value.evaluation = event.evaluation
@@ -310,9 +416,6 @@ export function useOrchestrator() {
             currentSession.value.status = 'AwaitingInput'
             const queue = mergePendingQuestions(currentSession.value.pendingQuestions ?? [], [event.question])
             currentSession.value.pendingQuestions = queue
-            if (!pendingQuestion.value) {
-              pendingQuestion.value = queue[0] ?? null
-            }
           }
         }
         break
@@ -356,21 +459,7 @@ export function useOrchestrator() {
         })
         if (res.ok) {
           const updated: SessionState = await res.json()
-          currentSession.value = updated
-          pendingQuestion.value = updated.pendingQuestions?.[0] ?? null
-          orchestratorState.value =
-            updated.status === 'AwaitingInput'
-              ? 'awaiting-input'
-              : updated.status === 'AwaitingApproval'
-                ? 'awaiting-approval'
-                : updated.status === 'Failed'
-                  ? 'failed'
-                : 'idle'
-
-          if (updated.status === 'AwaitingApproval' && updated.evaluation) {
-            const winnerAgent = agents.find(a => a.name === updated.evaluation!.winner)
-            if (winnerAgent) winnerAgent.status = 'winner'
-          }
+          applySessionState(updated)
         }
       } catch { /* non-critical */ }
       return
@@ -452,20 +541,54 @@ export function useOrchestrator() {
         throw new Error(`Failed to submit answer: HTTP ${response.status}${details}`)
       }
 
-      const updated: SessionState = await response.json()
-      const existingQueue = currentSession.value?.pendingQuestions ?? []
-      const answeredQuestionId = questionId
-      const mergedQueue = mergePendingQuestions(existingQueue, updated.pendingQuestions ?? [])
-        .filter(q => q.questionId !== answeredQuestionId)
+      // Prefer streaming continuation so tokens update directly in the original agent card.
+      const isStream = response.headers.get('content-type')?.includes('text/event-stream')
+      if (isStream && response.body) {
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
 
-      currentSession.value = {
-        ...updated,
-        pendingQuestions: mergedQueue,
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+            try {
+              const event: StreamEvent = JSON.parse(line.slice(6))
+              handleEvent(event)
+            } catch (e) {
+              console.warn('Answer SSE event parse/handle error:', e)
+            }
+          }
+        }
+
+        if (!currentSession.value || currentSession.value.id !== sessionId) {
+          const loaded = await syncSessionState(sessionId)
+          if (loaded) applySessionState(loaded)
+        }
+        return true
       }
 
-      const remaining = mergedQueue
-      pendingQuestion.value = remaining[0] ?? null
-      orchestratorState.value = pendingQuestion.value
+      // Backward-compatible fallback if endpoint returns JSON.
+      const updated: SessionState = await response.json()
+      const existingSession = currentSession.value
+      const sameSession = !!existingSession?.id && existingSession.id === updated.id
+      const answeredQuestionId = questionId
+      const mergedQueue = (updated.pendingQuestions ?? []).filter(q => q.questionId !== answeredQuestionId)
+      const mergedHistory = sameSession
+        ? mergeChatHistory(existingSession?.chatHistory ?? [], updated.chatHistory ?? [])
+        : (updated.chatHistory ?? [])
+      const mergedAgentResults = sameSession
+        ? mergeAgentResults(existingSession?.agentResults ?? [], updated.agentResults ?? [])
+        : (updated.agentResults ?? [])
+
+      currentSession.value = { ...updated, chatHistory: mergedHistory, agentResults: mergedAgentResults, pendingQuestions: mergedQueue }
+      orchestratorState.value = mergedQueue.length > 0
         ? 'awaiting-input'
         : updated.status === 'AwaitingApproval'
           ? 'awaiting-approval'
@@ -474,33 +597,13 @@ export function useOrchestrator() {
             : updated.status === 'Evaluating'
               ? 'evaluating'
               : 'idle'
-
-      if (pendingQuestion.value) {
-        // More questions remain; do not restart orchestration yet.
-        return true
-      }
-
-      // Backend now continues only the originating agent branch and returns updated state.
-      if (updated.status === 'AwaitingApproval' && updated.evaluation) {
-        const winnerAgent = agents.find(a => a.name === updated.evaluation!.winner)
-        if (winnerAgent) winnerAgent.status = 'winner'
-      }
+      if (updated.status === 'AgentsRunning' || updated.status === 'Evaluating') await pollSessionUntilProgress(sessionId)
       return true
     } catch (e: any) {
       if (e?.message?.includes('Question') && e?.message?.includes('not found')) {
         try {
-          await loadSession(sessionId)
-          if (currentSession.value) {
-            pendingQuestion.value = currentSession.value.pendingQuestions?.[0] ?? null
-            orchestratorState.value =
-              currentSession.value.status === 'AwaitingInput'
-                ? 'awaiting-input'
-                : currentSession.value.status === 'AwaitingApproval'
-                  ? 'awaiting-approval'
-                  : currentSession.value.status === 'Failed'
-                    ? 'failed'
-                    : 'idle'
-          }
+          const loaded = await syncSessionState(sessionId)
+          if (loaded) applySessionState(loaded)
         } catch {
           // Keep original error if refresh fails.
         }
@@ -533,37 +636,11 @@ export function useOrchestrator() {
     const loaded: SessionState | null = await res.json()
     if (!loaded) {
       currentSession.value = null
-      pendingQuestion.value = null
       orchestratorState.value = 'idle'
       return
     }
 
-    currentSession.value = loaded
-    pendingQuestion.value = loaded.pendingQuestions?.[0] ?? null
-
-    switch (loaded.status) {
-      case 'AgentsRunning':
-        orchestratorState.value = 'fan-out'
-        break
-      case 'Evaluating':
-        orchestratorState.value = 'evaluating'
-        break
-      case 'AwaitingInput':
-        orchestratorState.value = 'awaiting-input'
-        break
-      case 'AwaitingApproval':
-        orchestratorState.value = 'awaiting-approval'
-        break
-      case 'Accepted':
-        orchestratorState.value = 'accepted'
-        break
-      case 'Failed':
-        orchestratorState.value = 'failed'
-        break
-      default:
-        orchestratorState.value = 'idle'
-        break
-    }
+    applySessionState(loaded)
   }
 
   async function getPromptConfig(): Promise<PromptConfig> {
@@ -587,7 +664,6 @@ export function useOrchestrator() {
     agents.forEach(a => { a.status = 'idle'; a.elapsedMs = undefined })
     error.value = null
     acceptedResponse.value = null
-    pendingQuestion.value = null
   }
 
   return {
@@ -598,7 +674,6 @@ export function useOrchestrator() {
     isProcessing,
     error,
     acceptedResponse,
-    pendingQuestion,
     excludedAgents,
     includeAgent,
     includeAllAgents,

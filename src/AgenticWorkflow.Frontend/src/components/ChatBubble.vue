@@ -3,7 +3,10 @@ import { computed } from 'vue'
 import type { ChatMessage } from '../types'
 import { renderMarkdown } from '../utils/markdown'
 
-const props = defineProps<{ message: ChatMessage }>()
+const props = defineProps<{
+  message: ChatMessage
+  showPromptInline?: boolean
+}>()
 
 const renderedContent = computed(() => {
   return renderMarkdown(props.message.content)
@@ -44,6 +47,9 @@ function roleIcon(role: string) {
       <span class="bubble-time">{{ new Date(message.timestamp).toLocaleTimeString() }}</span>
     </div>
     <div class="bubble-content markdown-body" v-html="renderedContent"></div>
+    <div v-if="showPromptInline" class="prompt-inline-slot">
+      <slot name="promptInline" />
+    </div>
   </div>
 </template>
 
@@ -159,5 +165,9 @@ function roleIcon(role: string) {
 }
 .bubble-content :deep(th) {
   background: rgba(255, 255, 255, 0.05);
+}
+
+.prompt-inline-slot {
+  margin-top: 0.75rem;
 }
 </style>

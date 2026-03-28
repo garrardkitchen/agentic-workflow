@@ -669,8 +669,14 @@ app.MapPost("/api/sessions/{id}/answer", async (
     IHttpClientFactory httpClientFactory,
     CopilotClient copilotClient,
     ILogger<Program> logger,
+    HttpContext httpContext,
     CancellationToken ct) =>
 {
+    httpContext.Response.ContentType = "text/event-stream";
+    httpContext.Response.Headers.CacheControl = "no-cache";
+    httpContext.Response.Headers.Connection = "keep-alive";
+    using var sseLock = new SemaphoreSlim(1, 1);
+
     var sessionLock = sessionMutationLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
     string? continuationServiceName = null;
     string? continuationPrompt = null;
@@ -683,23 +689,73 @@ app.MapPost("/api/sessions/{id}/answer", async (
     try
     {
         var session = await sessionStore.GetAsync(id, ct);
-        if (session is null) return Results.NotFound();
+        if (session is null)
+        {
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "error",
+                SessionId = id,
+                Content = "Session not found.",
+                Status = SessionStatus.Failed
+            }, jsonOptions, sseLock);
+            return;
+        }
 
         if (session.PendingQuestions.Count == 0)
-            return Results.BadRequest(new { error = $"Session is not awaiting input (current status: {session.Status})" });
+        {
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "error",
+                SessionId = id,
+                Content = $"Session is not awaiting input (current status: {session.Status})"
+            }, jsonOptions, sseLock);
+            return;
+        }
 
         var question = session.PendingQuestions.FirstOrDefault(q => q.QuestionId == answer.QuestionId);
         if (question is null)
-            return Results.BadRequest(new { error = $"Question '{answer.QuestionId}' not found for this session." });
+        {
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "error",
+                SessionId = id,
+                Content = $"Question '{answer.QuestionId}' not found for this session."
+            }, jsonOptions, sseLock);
+            return;
+        }
 
         if (question.InputType == QuestionInputType.FreeText && string.IsNullOrWhiteSpace(answer.AnswerText))
-            return Results.BadRequest(new { error = "Answer text is required for free-text questions." });
+        {
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "error",
+                SessionId = id,
+                Content = "Answer text is required for free-text questions."
+            }, jsonOptions, sseLock);
+            return;
+        }
 
         if (question.InputType != QuestionInputType.FreeText && (answer.SelectedChoices is null || answer.SelectedChoices.Count == 0))
-            return Results.BadRequest(new { error = "At least one selected choice is required for choice questions." });
+        {
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "error",
+                SessionId = id,
+                Content = "At least one selected choice is required for choice questions."
+            }, jsonOptions, sseLock);
+            return;
+        }
 
         if (question.InputType == QuestionInputType.SingleChoice && (answer.SelectedChoices is null || answer.SelectedChoices.Count != 1))
-            return Results.BadRequest(new { error = "SingleChoice questions require exactly one selected choice." });
+        {
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "error",
+                SessionId = id,
+                Content = "SingleChoice questions require exactly one selected choice."
+            }, jsonOptions, sseLock);
+            return;
+        }
 
         if (question.InputType != QuestionInputType.FreeText && answer.SelectedChoices is not null)
         {
@@ -708,7 +764,15 @@ app.MapPost("/api/sessions/{id}/answer", async (
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
             if (invalidChoices.Count > 0)
-                return Results.BadRequest(new { error = $"Invalid choices: {string.Join(", ", invalidChoices)}" });
+            {
+                await SendEvent(httpContext, new StreamEvent
+                {
+                    Type = "error",
+                    SessionId = id,
+                    Content = $"Invalid choices: {string.Join(", ", invalidChoices)}"
+                }, jsonOptions, sseLock);
+                return;
+            }
         }
 
         session.PendingQuestions.RemoveAll(q => q.QuestionId == question.QuestionId);
@@ -737,7 +801,15 @@ app.MapPost("/api/sessions/{id}/answer", async (
         {
             var serviceName = GetServiceNameForAgent(question.SourceName);
             if (serviceName is null)
-                return Results.BadRequest(new { error = $"Unknown question source '{question.SourceName}'." });
+            {
+                await SendEvent(httpContext, new StreamEvent
+                {
+                    Type = "error",
+                    SessionId = id,
+                    Content = $"Unknown question source '{question.SourceName}'."
+                }, jsonOptions, sseLock);
+                return;
+            }
 
             var promptConfig = await promptStore.GetAsync(ct);
             var defaultPrompt = session.SystemPrompt ?? promptConfig.DrivingSystemPrompt;
@@ -755,11 +827,36 @@ app.MapPost("/api/sessions/{id}/answer", async (
         if (session.PendingQuestions.Count > 0)
         {
             session.Status = SessionStatus.AwaitingInput;
+            await sessionStore.UpdateAsync(session, ct);
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "status",
+                SessionId = id,
+                Status = SessionStatus.AwaitingInput
+            }, jsonOptions, sseLock);
+            foreach (var pending in session.PendingQuestions)
+            {
+                await SendEvent(httpContext, new StreamEvent
+                {
+                    Type = "question_required",
+                    SessionId = id,
+                    Content = pending.Prompt,
+                    Question = pending,
+                    Status = SessionStatus.AwaitingInput
+                }, jsonOptions, sseLock);
+            }
+            return;
         }
         else if (hasAsyncContinuation)
         {
-            // Return immediately and finish continuation/evaluation in background.
             session.Status = SessionStatus.AgentsRunning;
+            await sessionStore.UpdateAsync(session, ct);
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "status",
+                SessionId = id,
+                Status = SessionStatus.AgentsRunning
+            }, jsonOptions, sseLock);
         }
         else
         {
@@ -774,6 +871,15 @@ app.MapPost("/api/sessions/{id}/answer", async (
                     Role = "system",
                     Content = "No successful agent responses available for evaluation."
                 });
+                await sessionStore.UpdateAsync(session, ct);
+                await SendEvent(httpContext, new StreamEvent
+                {
+                    Type = "error",
+                    SessionId = id,
+                    Content = "No successful agent responses available for evaluation.",
+                    Status = SessionStatus.Failed
+                }, jsonOptions, sseLock);
+                return;
             }
             else
             {
@@ -789,131 +895,286 @@ app.MapPost("/api/sessions/{id}/answer", async (
                     Content = $"Winner: {session.Evaluation.Winner}\n\n{session.Evaluation.Reasoning}"
                 });
                 session.Status = SessionStatus.AwaitingApproval;
+                await sessionStore.UpdateAsync(session, ct);
+                await SendEvent(httpContext, new StreamEvent
+                {
+                    Type = "evaluation",
+                    SessionId = id,
+                    Content = session.Evaluation.Reasoning,
+                    Evaluation = session.Evaluation,
+                    Status = SessionStatus.AwaitingApproval
+                }, jsonOptions, sseLock);
+                return;
             }
         }
 
-        await sessionStore.UpdateAsync(session, ct);
         logger.LogInformation("Session {SessionId} answered question {QuestionId}", id, question.QuestionId);
 
-        _ = Task.Run(async () =>
+        AgentResult? updatedResult = null;
+        if (!string.IsNullOrWhiteSpace(continuationServiceName) &&
+            !string.IsNullOrWhiteSpace(continuationPrompt))
         {
-            try
+            var client = httpClientFactory.CreateClient(continuationServiceName);
+            var streamPath =
+                $"/api/run-stream?prompt={Uri.EscapeDataString(continuationPrompt)}" +
+                $"&systemPrompt={Uri.EscapeDataString(continuationAgentPrompt ?? string.Empty)}";
+
+            using var streamRequest = new HttpRequestMessage(HttpMethod.Get, streamPath);
+            using var continuationResponse = await client.SendAsync(streamRequest, HttpCompletionOption.ResponseHeadersRead, ct);
+            continuationResponse.EnsureSuccessStatusCode();
+
+            await using var responseStream = await continuationResponse.Content.ReadAsStreamAsync(ct);
+            using var reader = new StreamReader(responseStream);
+            var streamMessageId = answeredQuestionContextMessageId ?? $"m-{Guid.NewGuid():N}";
+            var existingMessage = session.ChatHistory.LastOrDefault(m => m.Role == "agent" && m.MessageId == streamMessageId);
+            var baseResponseText = existingMessage?.Content ?? string.Empty;
+
+            var continuationText = new StringBuilder();
+            var resultAgentName = answeredQuestionSourceName ?? GetAgentNameForServiceName(continuationServiceName);
+            var resultModel = "unknown";
+            long elapsedMs = 0;
+            bool failed = false;
+            string? errorText = null;
+
+            while (true)
             {
-                AgentResult? updatedResult = null;
-                if (!string.IsNullOrWhiteSpace(continuationServiceName) &&
-                    !string.IsNullOrWhiteSpace(continuationPrompt))
-                {
-                    var client = httpClientFactory.CreateClient(continuationServiceName);
-                    var continuationRequest = new AgentRequest
-                    {
-                        Prompt = continuationPrompt,
-                        SessionId = id,
-                        SystemPromptOverride = continuationAgentPrompt
-                    };
+                var line = await reader.ReadLineAsync(ct);
+                if (line is null) break;
+                if (string.IsNullOrWhiteSpace(line) || !line.StartsWith("data: ", StringComparison.Ordinal))
+                    continue;
 
-                    using var continuationResponse = await client.PostAsJsonAsync("/api/run", continuationRequest, CancellationToken.None);
-                    continuationResponse.EnsureSuccessStatusCode();
-                    updatedResult = await continuationResponse.Content.ReadFromJsonAsync<AgentResult>(CancellationToken.None);
-                }
-
-                var bgLock = sessionMutationLocks.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
-                await bgLock.WaitAsync(CancellationToken.None);
+                var payload = line[6..];
                 try
                 {
-                    var current = await sessionStore.GetAsync(id, CancellationToken.None);
-                    if (current is null) return;
+                    using var json = JsonDocument.Parse(payload);
+                    var root = json.RootElement;
 
-                    if (updatedResult is not null)
+                    if (root.TryGetProperty("agent", out var agentProp))
                     {
-                        var existing = current.AgentResults.FindIndex(r => r.AgentName == updatedResult.AgentName);
-                        if (existing >= 0) current.AgentResults[existing] = updatedResult;
-                        else current.AgentResults.Add(updatedResult);
+                        var streamedAgent = agentProp.GetString();
+                        if (!string.IsNullOrWhiteSpace(streamedAgent))
+                            resultAgentName = streamedAgent!;
+                    }
 
-                        current.ChatHistory.Add(new ChatMessage
-                        {
-                            Role = "agent",
-                            MessageId = $"m-{Guid.NewGuid():N}",
-                            ParentMessageId = answeredQuestionContextMessageId,
-                            Content = updatedResult.ResponseText,
-                            AgentName = updatedResult.AgentName
-                        });
-                        var contextMessageId = current.ChatHistory.Last().MessageId;
+                    if (root.TryGetProperty("model", out var modelProp))
+                    {
+                        var streamedModel = modelProp.GetString();
+                        if (!string.IsNullOrWhiteSpace(streamedModel))
+                            resultModel = streamedModel!;
+                    }
 
-                        var contextByAgent = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                        if (!string.IsNullOrWhiteSpace(contextMessageId))
+                    if (root.TryGetProperty("text", out var textProp))
+                    {
+                        var token = textProp.GetString() ?? string.Empty;
+                        if (token.Length > 0)
                         {
-                            contextByAgent[updatedResult.AgentName] = contextMessageId;
-                        }
-
-                        var followUps = TryExtractUserQuestions([updatedResult], contextByAgent);
-                        foreach (var followUp in followUps)
-                        {
-                            var duplicatePending = current.PendingQuestions.Any(p =>
-                                string.Equals(p.SourceName, followUp.SourceName, StringComparison.OrdinalIgnoreCase) &&
-                                string.Equals(p.Prompt.Trim(), followUp.Prompt.Trim(), StringComparison.OrdinalIgnoreCase));
-                            if (!duplicatePending)
+                            continuationText.Append(token);
+                            await SendEvent(httpContext, new StreamEvent
                             {
-                                current.PendingQuestions.Add(followUp);
-                                current.ChatHistory.Add(new ChatMessage
-                                {
-                                    Role = "question",
-                                    ParentMessageId = followUp.ContextMessageId,
-                                    Content = followUp.Prompt,
-                                    AgentName = followUp.SourceName
-                                });
-                            }
+                                Type = "agent_token",
+                                SessionId = id,
+                                AgentName = resultAgentName,
+                                MessageId = streamMessageId,
+                                Content = token
+                            }, jsonOptions, sseLock);
                         }
                     }
 
-                    if (current.PendingQuestions.Count > 0)
+                    if (root.TryGetProperty("elapsedMs", out var elapsedProp) && elapsedProp.TryGetInt64(out var parsedElapsed))
                     {
-                        current.Status = SessionStatus.AwaitingInput;
-                    }
-                    else
-                    {
-                        var promptConfig = await promptStore.GetAsync(CancellationToken.None);
-                        current.Status = SessionStatus.Evaluating;
-                        var evaluationCandidates = current.AgentResults.Where(r => !r.Failed).ToArray();
-                        if (evaluationCandidates.Length == 0)
-                        {
-                            current.Status = SessionStatus.Failed;
-                            current.ChatHistory.Add(new ChatMessage
-                            {
-                                Role = "system",
-                                Content = "No successful agent responses available for evaluation."
-                            });
-                        }
-                        else
-                        {
-                            current.Evaluation = await EvaluateResponsesAsync(
-                                evaluationCandidates,
-                                originalPrompt ?? current.Prompt,
-                                promptConfig.EvaluatorPrompt,
-                                copilotClient,
-                                logger);
-                            current.ChatHistory.Add(new ChatMessage
-                            {
-                                Role = "evaluator",
-                                Content = $"Winner: {current.Evaluation.Winner}\n\n{current.Evaluation.Reasoning}"
-                            });
-                            current.Status = SessionStatus.AwaitingApproval;
-                        }
+                        elapsedMs = parsedElapsed;
                     }
 
-                    await sessionStore.UpdateAsync(current, CancellationToken.None);
+                    if (root.TryGetProperty("error", out var errorProp))
+                    {
+                        failed = true;
+                        errorText = errorProp.GetString() ?? "Unknown agent streaming error";
+                    }
+
+                    if (root.TryGetProperty("done", out var doneProp) &&
+                        doneProp.ValueKind == JsonValueKind.True)
+                    {
+                        break;
+                    }
                 }
-                finally
+                catch (JsonException jsonEx)
                 {
-                    bgLock.Release();
+                    logger.LogWarning(jsonEx, "Continuation stream sent invalid payload for session {SessionId}", id);
                 }
             }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Async continuation failed for session {SessionId}", id);
-            }
-        });
 
-        return Results.Ok(session);
+            var continuationResponseText = continuationText.ToString();
+            var fullResponseText = string.IsNullOrWhiteSpace(baseResponseText)
+                ? continuationResponseText
+                : string.IsNullOrWhiteSpace(continuationResponseText)
+                    ? baseResponseText
+                    : $"{baseResponseText}\n\n{continuationResponseText}";
+
+            updatedResult = new AgentResult
+            {
+                AgentName = resultAgentName,
+                Model = resultModel,
+                ResponseText = fullResponseText,
+                ElapsedMs = elapsedMs,
+                Failed = failed,
+                Error = errorText
+            };
+
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "agent_complete",
+                SessionId = id,
+                AgentName = updatedResult.AgentName,
+                MessageId = streamMessageId,
+                Content = updatedResult.ResponseText,
+                AgentResult = updatedResult
+            }, jsonOptions, sseLock);
+        }
+
+        if (updatedResult is not null)
+        {
+            var existingResult = session.AgentResults.FindIndex(r =>
+                string.Equals(r.AgentName, updatedResult.AgentName, StringComparison.OrdinalIgnoreCase));
+            if (existingResult >= 0) session.AgentResults[existingResult] = updatedResult;
+            else session.AgentResults.Add(updatedResult);
+
+            var messageId = answeredQuestionContextMessageId ?? $"m-{Guid.NewGuid():N}";
+            var existingMessage = session.ChatHistory.FindIndex(m => m.Role == "agent" && m.MessageId == messageId);
+            if (existingMessage >= 0)
+            {
+                var previous = session.ChatHistory[existingMessage];
+                session.ChatHistory[existingMessage] = new ChatMessage
+                {
+                    Role = previous.Role,
+                    MessageId = previous.MessageId,
+                    ParentMessageId = previous.ParentMessageId,
+                    Content = updatedResult.ResponseText,
+                    AgentName = updatedResult.AgentName
+                };
+            }
+            else
+            {
+                session.ChatHistory.Add(new ChatMessage
+                {
+                    Role = "agent",
+                    MessageId = messageId,
+                    ParentMessageId = answeredQuestionContextMessageId,
+                    Content = updatedResult.ResponseText,
+                    AgentName = updatedResult.AgentName
+                });
+            }
+
+            if (!updatedResult.Failed)
+            {
+                var contextByAgent = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [updatedResult.AgentName] = messageId
+                };
+                var followUps = TryExtractUserQuestions([updatedResult], contextByAgent);
+                foreach (var followUp in followUps)
+                {
+                    var duplicatePending = session.PendingQuestions.Any(p =>
+                        string.Equals(p.SourceName, followUp.SourceName, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(p.Prompt.Trim(), followUp.Prompt.Trim(), StringComparison.OrdinalIgnoreCase));
+                    if (duplicatePending) continue;
+
+                    session.PendingQuestions.Add(followUp);
+                    session.ChatHistory.Add(new ChatMessage
+                    {
+                        Role = "question",
+                        ParentMessageId = followUp.ContextMessageId,
+                        Content = followUp.Prompt,
+                        AgentName = followUp.SourceName
+                    });
+
+                    await SendEvent(httpContext, new StreamEvent
+                    {
+                        Type = "question_required",
+                        SessionId = id,
+                        Content = followUp.Prompt,
+                        Question = followUp,
+                        Status = SessionStatus.AwaitingInput
+                    }, jsonOptions, sseLock);
+                }
+            }
+            else
+            {
+                await SendEvent(httpContext, new StreamEvent
+                {
+                    Type = "error",
+                    SessionId = id,
+                    AgentName = continuationServiceName,
+                    Content = updatedResult.Error ?? $"Agent {updatedResult.AgentName} failed during continuation."
+                }, jsonOptions, sseLock);
+            }
+        }
+
+        if (session.PendingQuestions.Count > 0)
+        {
+            session.Status = SessionStatus.AwaitingInput;
+            await sessionStore.UpdateAsync(session, ct);
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "status",
+                SessionId = id,
+                Status = SessionStatus.AwaitingInput
+            }, jsonOptions, sseLock);
+            return;
+        }
+
+        var finalPromptConfig = await promptStore.GetAsync(ct);
+        session.Status = SessionStatus.Evaluating;
+        await sessionStore.UpdateAsync(session, ct);
+
+        await SendEvent(httpContext, new StreamEvent
+        {
+            Type = "status",
+            SessionId = id,
+            Status = SessionStatus.Evaluating
+        }, jsonOptions, sseLock);
+
+        var finalCandidates = session.AgentResults.Where(r => !r.Failed).ToArray();
+        if (finalCandidates.Length == 0)
+        {
+            session.Status = SessionStatus.Failed;
+            session.ChatHistory.Add(new ChatMessage
+            {
+                Role = "system",
+                Content = "No successful agent responses available for evaluation."
+            });
+            await sessionStore.UpdateAsync(session, ct);
+            await SendEvent(httpContext, new StreamEvent
+            {
+                Type = "error",
+                SessionId = id,
+                Content = "No successful agent responses available for evaluation.",
+                Status = SessionStatus.Failed
+            }, jsonOptions, sseLock);
+            return;
+        }
+
+        session.Evaluation = await EvaluateResponsesAsync(
+            finalCandidates,
+            originalPrompt ?? session.Prompt,
+            finalPromptConfig.EvaluatorPrompt,
+            copilotClient,
+            logger);
+        session.ChatHistory.Add(new ChatMessage
+        {
+            Role = "evaluator",
+            Content = $"Winner: {session.Evaluation.Winner}\n\n{session.Evaluation.Reasoning}"
+        });
+        session.Status = SessionStatus.AwaitingApproval;
+        await sessionStore.UpdateAsync(session, ct);
+        await SendEvent(httpContext, new StreamEvent
+        {
+            Type = "evaluation",
+            SessionId = id,
+            Content = session.Evaluation.Reasoning,
+            Evaluation = session.Evaluation,
+            Status = SessionStatus.AwaitingApproval
+        }, jsonOptions, sseLock);
+        return;
     }
     finally
     {
