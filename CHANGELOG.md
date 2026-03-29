@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## 2026-03-29
+
+### Changed
+
+- Clarification answering in each agent tab now uses a chat-like composer (input + send) instead of the previous inline “submit answer” card UI.
+- Frontend now uses PrimeVue `Tabs`/`TabList`/`Tab` for agent-specific chat tabs, preserving per-agent status labels (`Awaiting input`, `Ready`, `Running`, `Failed`, `Idle`) in tab titles.
+- Frontend replaces inline per-message question cards with a single **Clarifications** inbox panel that lists all pending questions together.
+- Clarification UX now allows concurrent submissions per question (each question tracks its own in-flight state instead of globally blocking all submissions).
+- Gateway answer flow now continues the originating agent immediately after an answer, even when other questions are still pending, so independent agent threads can progress in parallel.
+
 ### Added
 
 - `AgenticWorkflow.Agent.Sonnet`: adds Spectre.Console CLI prompt for user name on startup using `AnsiConsole.Ask`.

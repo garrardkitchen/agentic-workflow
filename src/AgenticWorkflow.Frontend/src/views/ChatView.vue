@@ -4,10 +4,12 @@ import { useOrchestrator } from '../composables/useOrchestrator'
 import OrchestratorVisualizer from '../components/OrchestratorVisualizer.vue'
 import ChatBubble from '../components/ChatBubble.vue'
 import { renderMarkdown } from '../utils/markdown'
-import type { ChatMessage, UserQuestion } from '../types'
+import type { UserQuestion } from '../types'
 import Button from 'primevue/button'
 import InputText from 'primevue/inputtext'
-import Textarea from 'primevue/textarea'
+import Tabs from 'primevue/tabs'
+import TabList from 'primevue/tablist'
+import Tab from 'primevue/tab'
 import Accordion from 'primevue/accordion'
 import AccordionPanel from 'primevue/accordionpanel'
 import AccordionHeader from 'primevue/accordionheader'
@@ -29,38 +31,11 @@ const questionAnswerTextById = ref<Record<string, string>>({})
 const questionChoiceById = ref<Record<string, string>>({})
 const questionChoicesById = ref<Record<string, string[]>>({})
 const submittingQuestionIds = ref<Set<string>>(new Set())
-const isSubmittingAnyQuestion = computed(() => submittingQuestionIds.value.size > 0)
+const lastAnsweredQuestionIdByAgent = ref<Record<string, string>>({})
+const activeAgentTab = ref('')
 const isAcceptedResponseExpanded = ref(false)
 const isResizingPanels = ref(false)
 const rightPanelWidth = ref(480)
-
-function getQuestionAnchorMessageId(question: UserQuestion): string | undefined {
-  if (question.contextMessageId) return question.contextMessageId
-  if (!currentSession.value) return undefined
-  const source = question.sourceName || question.source
-  const latestFromSource = [...currentSession.value.chatHistory]
-    .reverse()
-    .find(m => m.role === 'agent' && m.messageId && m.agentName === source)
-  return latestFromSource?.messageId
-}
-
-const pendingQuestionsByMessageId = computed(() => {
-  const grouped = new Map<string, UserQuestion[]>()
-  const pending = currentSession.value?.pendingQuestions ?? []
-  for (const question of pending) {
-    const anchorId = getQuestionAnchorMessageId(question)
-    if (!anchorId) continue
-    const list = grouped.get(anchorId) ?? []
-    list.push(question)
-    grouped.set(anchorId, list)
-  }
-  return grouped
-})
-
-function inlineQuestionsForMessage(message: ChatMessage): UserQuestion[] {
-  if (message.role !== 'agent' || !message.messageId) return []
-  return pendingQuestionsByMessageId.value.get(message.messageId) ?? []
-}
 
 function isQuestionSubmitting(questionId: string): boolean {
   return submittingQuestionIds.value.has(questionId)
@@ -108,6 +83,108 @@ function canSubmitQuestion(question: UserQuestion): boolean {
   return !!questionAnswerTextById.value[question.questionId]?.trim()
 }
 
+function getQuestionAgentName(question: UserQuestion): string {
+  return question.sourceName && agents.some(a => a.name === question.sourceName) ? question.sourceName : ''
+}
+
+const latestPendingQuestionByAgent = computed(() => {
+  const latest = new Map<string, UserQuestion>()
+  for (const question of currentSession.value?.pendingQuestions ?? []) {
+    const agentName = getQuestionAgentName(question)
+    if (!agentName) continue
+    const existing = latest.get(agentName)
+    if (!existing || new Date(question.timestamp).getTime() >= new Date(existing.timestamp).getTime()) {
+      latest.set(agentName, question)
+    }
+  }
+  return latest
+})
+
+const latestAgentMessageIdByAgent = computed(() => {
+  const latest = new Map<string, string>()
+  for (const message of currentSession.value?.chatHistory ?? []) {
+    if (message.role === 'agent' && message.agentName && message.messageId) {
+      latest.set(message.agentName, message.messageId)
+    }
+  }
+  return latest
+})
+
+const activeTabQuestion = computed(() => {
+  if (!activeAgentTab.value) return undefined
+  return latestPendingQuestionByAgent.value.get(activeAgentTab.value)
+})
+
+const activeTabLatestAgentMessage = computed(() => {
+  if (!currentSession.value || !activeAgentTab.value) return undefined
+  for (let i = currentSession.value.chatHistory.length - 1; i >= 0; i--) {
+    const message = currentSession.value.chatHistory[i]
+    if (message.role === 'agent' && message.agentName === activeAgentTab.value) {
+      return message
+    }
+  }
+  return undefined
+})
+
+const showAnsweredForActiveTab = computed(() => {
+  const message = activeTabLatestAgentMessage.value
+  if (!message) return false
+  return showAnsweredForMessage(message)
+})
+
+const showCompletedForActiveTab = computed(() => {
+  const message = activeTabLatestAgentMessage.value
+  if (!message) return false
+  return showCompletedForMessage(message)
+})
+
+function showAnsweredForMessage(message: { role: string; messageId?: string; agentName?: string }): boolean {
+  if (message.role !== 'agent' || !message.messageId || !message.agentName) return false
+  const hasPending = latestPendingQuestionByAgent.value.has(message.agentName)
+  if (hasPending) return false
+  if (!lastAnsweredQuestionIdByAgent.value[message.agentName]) return false
+  return latestAgentMessageIdByAgent.value.get(message.agentName) === message.messageId
+}
+
+function showCompletedForMessage(message: { role: string; messageId?: string; agentName?: string }): boolean {
+  if (message.role !== 'agent' || !message.messageId || !message.agentName) return false
+  const latestMessageId = latestAgentMessageIdByAgent.value.get(message.agentName)
+  if (latestMessageId !== message.messageId) return false
+  if (latestPendingQuestionByAgent.value.has(message.agentName)) return false
+  const agentNode = agents.find(a => a.name === message.agentName)
+  return agentNode?.status === 'complete' || agentNode?.status === 'winner'
+}
+
+function agentTabState(agentName: string): 'awaiting' | 'ready' | 'running' | 'failed' | 'idle' {
+  if (latestPendingQuestionByAgent.value.has(agentName)) return 'awaiting'
+  const agentNode = agents.find(a => a.name === agentName)
+  if (!agentNode) return 'idle'
+  if (agentNode.status === 'winner' || agentNode.status === 'complete') return 'ready'
+  if (agentNode.status === 'running') return 'running'
+  if (agentNode.status === 'failed') return 'failed'
+  return 'idle'
+}
+
+function agentTabLabel(agentName: string): string {
+  const state = agentTabState(agentName)
+  if (state === 'awaiting') return 'Awaiting input'
+  if (state === 'ready') return 'Ready'
+  if (state === 'running') return 'Running'
+  if (state === 'failed') return 'Failed'
+  return 'Idle'
+}
+
+const activeAgentMessages = computed(() => {
+  if (!currentSession.value || !activeAgentTab.value) return []
+  return currentSession.value.chatHistory.filter(message => {
+    if (message.role === 'user' || message.role === 'system') return true
+    if (message.role === 'agent' || message.role === 'question' || message.role === 'answer') {
+      return message.agentName === activeAgentTab.value
+    }
+    return false
+  })
+})
+
 // Auto-switch accordion panel based on orchestration state
 watch(() => orchestratorState.value, (newState) => {
   if (newState === 'fan-out' || newState === 'evaluating') {
@@ -120,6 +197,16 @@ watch(() => orchestratorState.value, (newState) => {
     activePanel.value = 'accepted'
   }
 })
+
+watch(() => agents.map(a => a.name), (names) => {
+  if (names.length === 0) {
+    activeAgentTab.value = ''
+    return
+  }
+  if (!activeAgentTab.value || !names.includes(activeAgentTab.value)) {
+    activeAgentTab.value = names[0]
+  }
+}, { immediate: true })
 
 onMounted(() => {
   loadSessions()
@@ -168,6 +255,7 @@ async function handleSubmit() {
   historyIndex = -1
 
   promptInput.value = ''
+  lastAnsweredQuestionIdByAgent.value = {}
   resetState()
   await submitPrompt(prompt)
 }
@@ -180,6 +268,7 @@ async function handleDecision(d: 'accept' | 'decline' | 'restart') {
     questionAnswerTextById.value = {}
     questionChoiceById.value = {}
     questionChoicesById.value = {}
+    lastAnsweredQuestionIdByAgent.value = {}
   }
 }
 
@@ -194,7 +283,6 @@ async function handleRecover() {
 
 async function handleSubmitQuestionAnswer(question: UserQuestion) {
   if (!currentSession.value) return
-  if (isSubmittingAnyQuestion.value) return
   if (isQuestionSubmitting(question.questionId)) return
   if (!canSubmitQuestion(question)) return
 
@@ -218,12 +306,32 @@ async function handleSubmitQuestionAnswer(question: UserQuestion) {
       selectedChoices,
     )
     if (submitted) {
+      const agentName = getQuestionAgentName(question)
+      if (agentName) {
+        lastAnsweredQuestionIdByAgent.value = {
+          ...lastAnsweredQuestionIdByAgent.value,
+          [agentName]: question.questionId,
+        }
+      }
       clearQuestionDraftState(question.questionId)
     }
   } finally {
     const next = new Set(submittingQuestionIds.value)
     next.delete(question.questionId)
     submittingQuestionIds.value = next
+  }
+}
+
+async function submitActiveTabQuestion() {
+  if (!activeTabQuestion.value) return
+  await handleSubmitQuestionAnswer(activeTabQuestion.value)
+}
+
+function handleActiveTabQuestionKeydown(e: KeyboardEvent) {
+  if (!activeTabQuestion.value || activeTabQuestion.value.inputType !== 'FreeText') return
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    submitActiveTabQuestion()
   }
 }
 
@@ -378,92 +486,97 @@ onMounted(() => {
           <p>Enter a prompt to fan out to 3 AI agents and evaluate the best response.</p>
         </div>
 
+        <Tabs v-if="currentSession && agents.length > 0" v-model:value="activeAgentTab" class="agent-chat-tabs">
+          <TabList>
+            <Tab
+              v-for="agent in agents"
+              :key="agent.name"
+              :value="agent.name"
+              :class="[`state-${agentTabState(agent.name)}`]"
+            >
+              <div class="agent-chat-tab-label">
+                <span class="agent-chat-tab-name">{{ agent.name }}</span>
+                <span class="agent-chat-tab-status">{{ agentTabLabel(agent.name) }}</span>
+              </div>
+            </Tab>
+          </TabList>
+        </Tabs>
+
         <!-- Chat Messages -->
         <template v-if="currentSession">
-          <template v-for="(msg, i) in currentSession.chatHistory" :key="i">
+          <template v-for="(msg, i) in activeAgentMessages" :key="`${msg.messageId || i}-${activeAgentTab}`">
             <ChatBubble
               v-if="msg.role !== 'question' && msg.role !== 'answer'"
               :message="msg"
-              :showPromptInline="inlineQuestionsForMessage(msg).length > 0"
-            >
-              <template #promptInline>
-                <div
-                  v-for="question in inlineQuestionsForMessage(msg)"
-                  :key="question.questionId"
-                  class="inline-question-card"
-                >
-                  <div class="question-header">
-                    <span class="question-title">
-                      <i class="pi pi-question-circle" style="color: var(--accent-purple)"></i>
-                      {{ question.sourceName || question.source }} needs your input
-                    </span>
-                    <span class="question-type">{{ question.inputType }}</span>
-                  </div>
-                  <div class="question-prompt">{{ question.prompt }}</div>
-                  <div v-if="(currentSession?.pendingQuestions?.length ?? 0) > 1" class="question-queue-hint">
-                    {{ currentSession?.pendingQuestions?.length }} questions pending
-                  </div>
-
-                  <div v-if="question.inputType === 'SingleChoice'" class="question-choices">
-                    <button
-                      v-for="choice in question.choices"
-                      :key="choice"
-                      :class="['choice-chip', { selected: questionChoiceById[question.questionId] === choice }]"
-                      :disabled="isSubmittingAnyQuestion"
-                      @click="setQuestionChoice(question.questionId, choice)"
-                    >{{ choice }}</button>
-                  </div>
-
-                  <div v-else-if="question.inputType === 'MultiChoice'" class="question-choices">
-                    <button
-                      v-for="choice in question.choices"
-                      :key="choice"
-                      :class="['choice-chip', { selected: (questionChoicesById[question.questionId] ?? []).includes(choice) }]"
-                      :disabled="isSubmittingAnyQuestion"
-                      @click="toggleQuestionChoice(question.questionId, choice)"
-                    >{{ choice }}</button>
-                  </div>
-
-                  <Textarea
-                    v-else
-                    :modelValue="questionAnswerTextById[question.questionId] ?? ''"
-                    @update:modelValue="setQuestionAnswerText(question.questionId, String($event ?? ''))"
-                    rows="3"
-                    autoResize
-                    class="question-input mono"
-                    placeholder="Type your answer..."
-                    :disabled="isSubmittingAnyQuestion"
-                  />
-
-                  <div class="approval-buttons">
-                    <Button
-                      :label="isQuestionSubmitting(question.questionId) ? 'Submitting...' : 'Submit Answer'"
-                      icon="pi pi-check"
-                      severity="success"
-                      size="small"
-                      @click="handleSubmitQuestionAnswer(question)"
-                      :loading="isQuestionSubmitting(question.questionId)"
-                      :disabled="
-                        isSubmittingAnyQuestion ||
-                        !canSubmitQuestion(question)
-                      "
-                    />
-                    <Button
-                      v-if="currentSession?.pendingQuestions?.[0]?.questionId === question.questionId"
-                      label="Cancel"
-                      icon="pi pi-times"
-                      severity="secondary"
-                      size="small"
-                      outlined
-                      :disabled="isSubmittingAnyQuestion"
-                      @click="handleDecision('decline')"
-                    />
-                  </div>
-                </div>
-              </template>
-            </ChatBubble>
+            />
           </template>
 
+          <ChatBubble
+            v-if="activeTabQuestion"
+            :message="{
+              role: 'question',
+              content: activeTabQuestion.prompt,
+              agentName: activeTabQuestion.sourceName || activeTabQuestion.source,
+              timestamp: activeTabQuestion.timestamp,
+            }"
+          />
+
+          <div v-if="activeTabQuestion" class="agent-question-composer">
+            <div class="composer-header">
+              <span class="question-type">{{ activeTabQuestion.inputType }}</span>
+            </div>
+
+            <div v-if="activeTabQuestion.inputType !== 'FreeText'" class="question-choices">
+              <button
+                v-for="choice in activeTabQuestion.choices ?? []"
+                :key="choice"
+                :class="[
+                  'choice-chip',
+                  {
+                    selected: activeTabQuestion.inputType === 'SingleChoice'
+                      ? questionChoiceById[activeTabQuestion.questionId] === choice
+                      : (questionChoicesById[activeTabQuestion.questionId] ?? []).includes(choice),
+                  },
+                ]"
+                :disabled="isQuestionSubmitting(activeTabQuestion.questionId)"
+                @click="activeTabQuestion.inputType === 'SingleChoice'
+                  ? setQuestionChoice(activeTabQuestion.questionId, choice)
+                  : toggleQuestionChoice(activeTabQuestion.questionId, choice)"
+              >{{ choice }}</button>
+            </div>
+
+            <InputText
+              v-if="activeTabQuestion.inputType === 'FreeText'"
+              :modelValue="questionAnswerTextById[activeTabQuestion.questionId] ?? ''"
+              @update:modelValue="setQuestionAnswerText(activeTabQuestion.questionId, String($event ?? ''))"
+              class="question-composer-input"
+              placeholder="Type your reply and press Enter..."
+              :disabled="isQuestionSubmitting(activeTabQuestion.questionId)"
+              @keydown="handleActiveTabQuestionKeydown"
+            />
+
+            <div class="composer-actions">
+              <Button
+                icon="pi pi-send"
+                :label="isQuestionSubmitting(activeTabQuestion.questionId) ? 'Sending...' : 'Send'"
+                size="small"
+                severity="success"
+                :loading="isQuestionSubmitting(activeTabQuestion.questionId)"
+                :disabled="!canSubmitQuestion(activeTabQuestion)"
+                @click="submitActiveTabQuestion"
+              />
+            </div>
+          </div>
+
+          <div v-if="!activeTabQuestion && showAnsweredForActiveTab" class="clarification-answered-card">
+            <i class="pi pi-check-circle"></i>
+            <span>Answer submitted. Waiting for next question.</span>
+          </div>
+
+          <div v-else-if="!activeTabQuestion && showCompletedForActiveTab" class="agent-completed-card">
+            <i class="pi pi-verified"></i>
+            <span>{{ activeAgentTab }} complete.</span>
+          </div>
         </template>
 
         <!-- Error -->
@@ -662,14 +775,33 @@ onMounted(() => {
         <div class="approval-buttons">
           <Button label="Accept" icon="pi pi-check" severity="success" size="small" @click="handleDecision('accept')" />
           <Button label="Retry" icon="pi pi-refresh" severity="warning" size="small" outlined @click="handleDecision('restart')" />
-          <Button label="Cancel" icon="pi pi-times" severity="secondary" size="small" outlined @click="handleDecision('decline')" />
+          <Button
+            label="Cancel"
+            icon="pi pi-times"
+            severity="secondary"
+            size="small"
+            outlined
+            :disabled="submittingQuestionIds.size > 0"
+            @click="handleDecision('decline')"
+          />
         </div>
       </div>
       <div v-else-if="orchestratorState === 'awaiting-input'" class="approval-bar">
         <span class="approval-text">
           <i class="pi pi-comment" style="color: var(--accent-purple)"></i>
-          Respond inline in the chat above
+          Answer in the active agent chat tab
         </span>
+        <div class="approval-buttons">
+          <Button
+            label="Cancel"
+            icon="pi pi-times"
+            severity="secondary"
+            size="small"
+            outlined
+            :disabled="submittingQuestionIds.size > 0"
+            @click="handleDecision('decline')"
+          />
+        </div>
       </div>
       <div v-else-if="currentSession?.status === 'Failed'" class="approval-bar">
         <span class="approval-text">
@@ -816,6 +948,68 @@ onMounted(() => {
 }
 .empty-state h2 { font-size: 1.5rem; font-weight: 600; }
 .empty-state p { color: var(--text-secondary); font-size: 0.9rem; max-width: 400px; }
+
+.agent-chat-tabs {
+  margin-bottom: 0.9rem;
+}
+.agent-chat-tabs :deep(.p-tablist) {
+  background: transparent;
+  border: none;
+}
+.agent-chat-tabs :deep(.p-tablist-tab-list) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  border: none;
+  background: transparent;
+}
+.agent-chat-tabs :deep(.p-tab) {
+  border: 1px solid var(--border-glass);
+  border-radius: 999px;
+  background: rgba(255,255,255,0.03);
+  color: var(--text-secondary);
+  padding: 0.28rem 0.65rem;
+}
+.agent-chat-tabs :deep(.p-tab:hover) {
+  background: rgba(255,255,255,0.05);
+}
+.agent-chat-tabs :deep(.p-tab.p-tab-active) {
+  border-color: rgba(99,102,241,0.5);
+  background: rgba(99,102,241,0.08);
+  color: var(--text-primary);
+}
+.agent-chat-tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.73rem;
+}
+.agent-chat-tab-name {
+  font-weight: 600;
+}
+.agent-chat-tab-status {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-radius: 999px;
+  padding: 0.08rem 0.35rem;
+}
+.agent-chat-tabs :deep(.p-tab.state-awaiting) .agent-chat-tab-status {
+  color: var(--accent-purple);
+  background: rgba(139,92,246,0.14);
+}
+.agent-chat-tabs :deep(.p-tab.state-ready) .agent-chat-tab-status {
+  color: var(--accent-green);
+  background: rgba(16,185,129,0.14);
+}
+.agent-chat-tabs :deep(.p-tab.state-running) .agent-chat-tab-status {
+  color: var(--accent-blue);
+  background: rgba(59,130,246,0.14);
+}
+.agent-chat-tabs :deep(.p-tab.state-failed) .agent-chat-tab-status {
+  color: var(--accent-red);
+  background: rgba(239,68,68,0.14);
+}
 
 .right-panel {
   width: 480px;
@@ -1341,31 +1535,6 @@ onMounted(() => {
   gap: 0.5rem;
 }
 
-.question-bar,
-.inline-question-card {
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-}
-.inline-question-card {
-  margin: 0.25rem 0 0.9rem;
-  max-width: 85%;
-  background: rgba(139, 92, 246, 0.05);
-  border: 1px solid rgba(139, 92, 246, 0.2);
-  border-radius: 12px;
-  padding: 0.85rem 1rem;
-}
-.question-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.question-title {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  font-size: 0.9rem;
-}
 .question-type {
   font-size: 0.65rem;
   text-transform: uppercase;
@@ -1375,14 +1544,6 @@ onMounted(() => {
   background: rgba(139,92,246,0.08);
   border-radius: 4px;
   padding: 0.1rem 0.35rem;
-}
-.question-prompt {
-  color: var(--text-primary);
-  font-size: 0.85rem;
-}
-.question-queue-hint {
-  font-size: 0.72rem;
-  color: var(--text-secondary);
 }
 .question-choices {
   display: flex;
@@ -1407,10 +1568,51 @@ onMounted(() => {
   background: rgba(139,92,246,0.14);
   color: var(--text-primary);
 }
-.question-input {
+.question-composer-input {
   width: 100%;
   background: var(--bg-glass) !important;
   border-color: var(--border-glass) !important;
   color: var(--text-primary) !important;
+}
+.agent-question-composer {
+  margin-top: 0.35rem;
+  margin-bottom: 0.9rem;
+  padding: 0.8rem;
+  border: 1px solid rgba(139, 92, 246, 0.2);
+  border-radius: 12px;
+  background: rgba(139, 92, 246, 0.05);
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+.composer-header {
+  display: flex;
+  justify-content: flex-end;
+}
+.composer-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.clarification-answered-card {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--accent-green);
+  font-size: 0.82rem;
+  border: 1px solid rgba(16,185,129,0.3);
+  background: rgba(16,185,129,0.08);
+  border-radius: 10px;
+  padding: 0.65rem 0.8rem;
+}
+.agent-completed-card {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--accent-blue);
+  font-size: 0.82rem;
+  border: 1px solid rgba(59,130,246,0.28);
+  background: rgba(59,130,246,0.08);
+  border-radius: 10px;
+  padding: 0.65rem 0.8rem;
 }
 </style>
