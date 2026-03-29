@@ -3,10 +3,6 @@ using System.Text;
 using System.Text.Json;
 using AgenticWorkflow.Shared.Models;
 using GitHub.Copilot.SDK;
-using Spectre.Console;
-
-var name = AnsiConsole.Ask<string>("[green]What is your name?[/]");
-AnsiConsole.MarkupLine($"[bold]Hello, {name}![/]");
 
 var builder = WebApplication.CreateBuilder(args);
 builder.AddServiceDefaults();
