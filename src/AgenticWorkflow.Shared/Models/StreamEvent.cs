@@ -6,6 +6,7 @@ public sealed record StreamEvent
     public required string SessionId { get; init; }
     public string? AgentName { get; init; }
     public string? MessageId { get; init; }
+    public bool IsContinuation { get; init; }
     public string? Content { get; init; }
     public SessionStatus? Status { get; init; }
     public AgentResult? AgentResult { get; init; }

@@ -44,6 +44,7 @@ function roleIcon(role: string) {
       <span class="bubble-role" :style="{ color: roleColor(message.role) }">
         {{ message.agentName || message.role }}
       </span>
+      <span v-if="message.role === 'agent' && message.isContinuation" class="continuation-pill">continued</span>
       <span class="bubble-time">{{ new Date(message.timestamp).toLocaleTimeString() }}</span>
     </div>
     <div class="bubble-content markdown-body" v-html="renderedContent"></div>
@@ -101,6 +102,17 @@ function roleIcon(role: string) {
   margin-left: auto;
   color: var(--text-secondary);
   font-size: 0.65rem;
+}
+
+.continuation-pill {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--accent-purple);
+  background: rgba(139, 92, 246, 0.1);
+  border: 1px solid rgba(139, 92, 246, 0.28);
+  border-radius: 999px;
+  padding: 0.05rem 0.35rem;
 }
 
 .bubble-content {

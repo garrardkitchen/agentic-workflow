@@ -332,6 +332,7 @@ export function useOrchestrator() {
             if (existing) {
               existing.content = event.agentResult.responseText
               existing.agentName = event.agentResult.agentName
+              existing.isContinuation = event.isContinuation || existing.isContinuation
               existing.timestamp = event.timestamp
             } else {
               currentSession.value.chatHistory.push({
@@ -339,6 +340,7 @@ export function useOrchestrator() {
                 messageId: event.messageId,
                 content: event.agentResult.responseText,
                 agentName: event.agentResult.agentName,
+                isContinuation: event.isContinuation,
                 timestamp: event.timestamp,
               })
             }
@@ -366,6 +368,7 @@ export function useOrchestrator() {
               messageId,
               content: '',
               agentName,
+              isContinuation: event.isContinuation,
               timestamp: event.timestamp,
             }
             currentSession.value.chatHistory.push(target)
@@ -373,6 +376,7 @@ export function useOrchestrator() {
 
           target.content += event.content
           target.agentName = agentName
+          target.isContinuation = event.isContinuation || target.isContinuation
           target.timestamp = event.timestamp
 
           if (agent) agent.status = 'running'

@@ -38,5 +38,6 @@ public sealed record ChatMessage
     public string? MessageId { get; init; }
     public string? ParentMessageId { get; init; }
     public string? AgentName { get; init; }
+    public bool IsContinuation { get; init; }
     public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
 }

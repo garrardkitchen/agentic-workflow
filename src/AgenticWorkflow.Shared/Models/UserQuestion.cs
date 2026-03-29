@@ -25,6 +25,7 @@ public sealed record UserQuestion
 public sealed record UserQuestionAnswer
 {
     public required string QuestionId { get; init; }
+    public string? SourceName { get; init; }
     public string? AnswerText { get; init; }
     public List<string> SelectedChoices { get; init; } = [];
     public DateTimeOffset AnsweredAt { get; init; } = DateTimeOffset.UtcNow;

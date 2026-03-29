@@ -35,6 +35,7 @@ export interface ChatMessage {
   messageId?: string
   parentMessageId?: string
   agentName?: string
+  isContinuation?: boolean
   timestamp: string
 }
 
@@ -64,6 +65,7 @@ export interface UserQuestion {
 
 export interface UserQuestionAnswer {
   questionId: string
+  sourceName?: string
   answerText?: string
   selectedChoices: string[]
   answeredAt: string
@@ -88,6 +90,7 @@ export interface StreamEvent {
   sessionId: string
   agentName?: string
   messageId?: string
+  isContinuation?: boolean
   content?: string
   status?: SessionStatus
   agentResult?: AgentResult

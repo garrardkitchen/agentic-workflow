@@ -61,6 +61,8 @@ app.UseCors();
 var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 var sessionMutationLocks = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
 var activeAnswerContinuations = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+const int maxClarificationsPerAgent = 1;
+const int maxClarificationsPerSession = 3;
 
 // ── Prompt Config Endpoints ───────────────────────────────────────────
 
@@ -296,6 +298,14 @@ app.MapPost("/api/orchestrate", async (
                 var earlyQuestions = TryExtractUserQuestions([result], contextByAgent);
                 foreach (var q in earlyQuestions)
                 {
+                    if (!CanAcceptFollowUpQuestion(session, q, maxClarificationsPerAgent, maxClarificationsPerSession))
+                    {
+                        logger.LogInformation(
+                            "Skipping follow-up question from {AgentName} for session {SessionId}: clarification limit reached",
+                            q.SourceName ?? q.Source, sessionId);
+                        continue;
+                    }
+
                     var key = GetQuestionKey(q);
                     if (!emittedQuestionKeys.TryAdd(key, 0)) continue;
                     emittedQuestionsByKey.TryAdd(key, q);
@@ -415,6 +425,14 @@ app.MapPost("/api/orchestrate", async (
 
     foreach (var q in extractedFollowUpQuestions)
     {
+        if (!CanAcceptFollowUpQuestion(session, q, maxClarificationsPerAgent, maxClarificationsPerSession))
+        {
+            logger.LogInformation(
+                "Skipping follow-up question from {AgentName} for session {SessionId}: clarification limit reached",
+                q.SourceName ?? q.Source, sessionId);
+            continue;
+        }
+
         var key = GetQuestionKey(q);
         if (!seenQuestionKeys.Add(key)) continue;
         if (emittedQuestionsByKey.TryGetValue(key, out var emittedQuestion))
@@ -683,6 +701,7 @@ app.MapPost("/api/sessions/{id}/answer", async (
     string? continuationPrompt = null;
     string? continuationAgentPrompt = null;
     string? continuationMessageId = null;
+    string? continuationParentMessageId = null;
     string continuationBaseResponseText = string.Empty;
     string? answeredQuestionContextMessageId = null;
     string? answeredQuestionSourceName = null;
@@ -785,6 +804,7 @@ app.MapPost("/api/sessions/{id}/answer", async (
         var recorded = new UserQuestionAnswer
         {
             QuestionId = question.QuestionId,
+            SourceName = question.SourceName,
             AnswerText = answer.AnswerText,
             SelectedChoices = answer.SelectedChoices ?? []
         };
@@ -793,10 +813,12 @@ app.MapPost("/api/sessions/{id}/answer", async (
         var renderedAnswer = !string.IsNullOrWhiteSpace(answer.AnswerText)
             ? answer.AnswerText!
             : string.Join(", ", answer.SelectedChoices ?? []);
+        var answerMessageId = $"a-{question.QuestionId}";
 
         session.ChatHistory.Add(new ChatMessage
         {
             Role = "answer",
+            MessageId = answerMessageId,
             Content = renderedAnswer,
             ParentMessageId = question.ContextMessageId,
             AgentName = question.SourceName
@@ -825,9 +847,10 @@ app.MapPost("/api/sessions/{id}/answer", async (
             answeredQuestionContextMessageId = question.ContextMessageId;
             answeredQuestionSourceName = question.SourceName;
             originalPrompt = session.Prompt;
-            continuationMessageId = answeredQuestionContextMessageId ?? $"m-{Guid.NewGuid():N}";
+            continuationMessageId = $"m-{Guid.NewGuid():N}";
+            continuationParentMessageId = answerMessageId;
             var existingMessage = session.ChatHistory.LastOrDefault(m =>
-                m.Role == "agent" && m.MessageId == continuationMessageId);
+                m.Role == "agent" && m.MessageId == answeredQuestionContextMessageId);
             continuationBaseResponseText = existingMessage?.Content ?? string.Empty;
         }
 
@@ -887,7 +910,7 @@ app.MapPost("/api/sessions/{id}/answer", async (
 
                 await using var responseStream = await continuationResponse.Content.ReadAsStreamAsync(ct);
                 using var reader = new StreamReader(responseStream);
-                var streamMessageId = continuationMessageId ?? answeredQuestionContextMessageId ?? $"m-{Guid.NewGuid():N}";
+                var streamMessageId = continuationMessageId ?? $"m-{Guid.NewGuid():N}";
                 var baseResponseText = continuationBaseResponseText;
 
                 var continuationText = new StringBuilder();
@@ -936,6 +959,7 @@ app.MapPost("/api/sessions/{id}/answer", async (
                                     SessionId = id,
                                     AgentName = resultAgentName,
                                     MessageId = streamMessageId,
+                                    IsContinuation = true,
                                     Content = token
                                 }, jsonOptions, sseLock);
                             }
@@ -965,11 +989,9 @@ app.MapPost("/api/sessions/{id}/answer", async (
                 }
 
                 var continuationResponseText = continuationText.ToString();
-                var fullResponseText = string.IsNullOrWhiteSpace(baseResponseText)
-                    ? continuationResponseText
-                    : string.IsNullOrWhiteSpace(continuationResponseText)
-                        ? baseResponseText
-                        : $"{baseResponseText}\n\n{continuationResponseText}";
+                var fullResponseText = string.IsNullOrWhiteSpace(continuationResponseText)
+                    ? baseResponseText
+                    : continuationResponseText;
 
                 updatedResult = new AgentResult
                 {
@@ -987,6 +1009,7 @@ app.MapPost("/api/sessions/{id}/answer", async (
                     SessionId = id,
                     AgentName = updatedResult.AgentName,
                     MessageId = streamMessageId,
+                    IsContinuation = true,
                     Content = updatedResult.ResponseText,
                     AgentResult = updatedResult
                 }, jsonOptions, sseLock);
@@ -1031,31 +1054,16 @@ app.MapPost("/api/sessions/{id}/answer", async (
             if (existingResult >= 0) session.AgentResults[existingResult] = updatedResult;
             else session.AgentResults.Add(updatedResult);
 
-            var messageId = answeredQuestionContextMessageId ?? $"m-{Guid.NewGuid():N}";
-            var existingMessage = session.ChatHistory.FindIndex(m => m.Role == "agent" && m.MessageId == messageId);
-            if (existingMessage >= 0)
+            var messageId = continuationMessageId ?? $"m-{Guid.NewGuid():N}";
+            session.ChatHistory.Add(new ChatMessage
             {
-                var previous = session.ChatHistory[existingMessage];
-                session.ChatHistory[existingMessage] = new ChatMessage
-                {
-                    Role = previous.Role,
-                    MessageId = previous.MessageId,
-                    ParentMessageId = previous.ParentMessageId,
-                    Content = updatedResult.ResponseText,
-                    AgentName = updatedResult.AgentName
-                };
-            }
-            else
-            {
-                session.ChatHistory.Add(new ChatMessage
-                {
-                    Role = "agent",
-                    MessageId = messageId,
-                    ParentMessageId = answeredQuestionContextMessageId,
-                    Content = updatedResult.ResponseText,
-                    AgentName = updatedResult.AgentName
-                });
-            }
+                Role = "agent",
+                MessageId = messageId,
+                ParentMessageId = continuationParentMessageId ?? answeredQuestionContextMessageId,
+                Content = updatedResult.ResponseText,
+                AgentName = updatedResult.AgentName,
+                IsContinuation = true
+            });
 
             if (!updatedResult.Failed)
             {
@@ -1066,6 +1074,14 @@ app.MapPost("/api/sessions/{id}/answer", async (
                 var followUps = TryExtractUserQuestions([updatedResult], contextByAgent);
                 foreach (var followUp in followUps)
                 {
+                    if (!CanAcceptFollowUpQuestion(session, followUp, maxClarificationsPerAgent, maxClarificationsPerSession))
+                    {
+                        logger.LogInformation(
+                            "Skipping continuation follow-up from {AgentName} for session {SessionId}: clarification limit reached",
+                            followUp.SourceName ?? followUp.Source, id);
+                        continue;
+                    }
+
                     var duplicatePending = session.PendingQuestions.Any(p =>
                         string.Equals(p.SourceName, followUp.SourceName, StringComparison.OrdinalIgnoreCase) &&
                         string.Equals(p.Prompt.Trim(), followUp.Prompt.Trim(), StringComparison.OrdinalIgnoreCase));
@@ -1312,6 +1328,25 @@ static string GetAgentNameForServiceName(string serviceName)
     if (serviceName.Equals("agent-codex", StringComparison.OrdinalIgnoreCase)) return "Agent-GptCodex";
     if (serviceName.Equals("agent-gpt54", StringComparison.OrdinalIgnoreCase)) return "Agent-Gpt54";
     return serviceName;
+}
+
+static bool CanAcceptFollowUpQuestion(
+    SessionState session,
+    UserQuestion question,
+    int maxPerAgent,
+    int maxPerSession)
+{
+    var totalClarifications = session.PendingQuestions.Count + session.AnsweredQuestions.Count;
+    if (totalClarifications >= maxPerSession) return false;
+
+    if (string.IsNullOrWhiteSpace(question.SourceName)) return true;
+
+    var pendingFromAgent = session.PendingQuestions.Count(q =>
+        string.Equals(q.SourceName, question.SourceName, StringComparison.OrdinalIgnoreCase));
+    var answeredFromAgent = session.AnsweredQuestions.Count(a =>
+        string.Equals(a.SourceName, question.SourceName, StringComparison.OrdinalIgnoreCase));
+
+    return pendingFromAgent + answeredFromAgent < maxPerAgent;
 }
 
 static async Task<EvaluationResult> EvaluateResponsesAsync(

@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Agent chat bubbles now show a subtle `continued` header pill for continuation replies, preserving chat flow while making follow-up turns easy to identify.
+- Fixed continuation aggregation to avoid duplicating prior agent response text in evaluated/accepted output panes.
+- Clarification continuations now append as new sequential agent chat messages linked to the user’s answer message, instead of mutating the original agent response bubble.
+- Clarification tabs now render only the conversation thread and composer (no duplicated question card rendering), preserving strict chat chronology.
+- Agent tabs now present clarifications as a pure interactive chat flow (question bubbles + in-thread composer), removing non-chat status cards from the tab conversation.
+- Gateway now enforces clarification limits (`max 1` follow-up per agent, `max 3` per session) to prevent perpetual question loops and ensure sessions progress to evaluation.
+- Clarification limit counting now uses `AnsweredQuestions` consistently for both per-session and per-agent limits by recording `sourceName` on each `UserQuestionAnswer`.
+- Free-text clarification prompts that are phrased as binary yes/no questions now render explicit `Yes` / `No` choice chips in the agent chat composer instead of a plain text input.
 - Clarification answering in each agent tab now uses a chat-like composer (input + send) instead of the previous inline “submit answer” card UI.
 - Frontend now uses PrimeVue `Tabs`/`TabList`/`Tab` for agent-specific chat tabs, preserving per-agent status labels (`Awaiting input`, `Ready`, `Running`, `Failed`, `Idle`) in tab titles.
 - Frontend replaces inline per-message question cards with a single **Clarifications** inbox panel that lists all pending questions together.

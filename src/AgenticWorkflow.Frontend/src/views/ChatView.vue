@@ -31,7 +31,6 @@ const questionAnswerTextById = ref<Record<string, string>>({})
 const questionChoiceById = ref<Record<string, string>>({})
 const questionChoicesById = ref<Record<string, string[]>>({})
 const submittingQuestionIds = ref<Set<string>>(new Set())
-const lastAnsweredQuestionIdByAgent = ref<Record<string, string>>({})
 const activeAgentTab = ref('')
 const isAcceptedResponseExpanded = ref(false)
 const isResizingPanels = ref(false)
@@ -83,6 +82,19 @@ function canSubmitQuestion(question: UserQuestion): boolean {
   return !!questionAnswerTextById.value[question.questionId]?.trim()
 }
 
+function isBinaryFreeTextQuestion(question: UserQuestion): boolean {
+  if (question.inputType !== 'FreeText') return false
+  const prompt = question.prompt.trim().toLowerCase()
+  if (/yes\s*\/\s*no|yes or no|\(y\/n\)|\by\/n\b/.test(prompt)) return true
+  if (!prompt.endsWith('?')) return false
+  return /^(would you like( me)? to|do you want( me)? to|should i|shall i|can i|may i|is it okay if i|is this okay|does this look good|should we proceed|are you sure)\b/.test(prompt)
+}
+
+function questionInputLabel(question: UserQuestion): string {
+  if (isBinaryFreeTextQuestion(question)) return 'Yes/No'
+  return question.inputType
+}
+
 function getQuestionAgentName(question: UserQuestion): string {
   return question.sourceName && agents.some(a => a.name === question.sourceName) ? question.sourceName : ''
 }
@@ -100,60 +112,15 @@ const latestPendingQuestionByAgent = computed(() => {
   return latest
 })
 
-const latestAgentMessageIdByAgent = computed(() => {
-  const latest = new Map<string, string>()
-  for (const message of currentSession.value?.chatHistory ?? []) {
-    if (message.role === 'agent' && message.agentName && message.messageId) {
-      latest.set(message.agentName, message.messageId)
-    }
-  }
-  return latest
-})
-
 const activeTabQuestion = computed(() => {
   if (!activeAgentTab.value) return undefined
   return latestPendingQuestionByAgent.value.get(activeAgentTab.value)
 })
 
-const activeTabLatestAgentMessage = computed(() => {
-  if (!currentSession.value || !activeAgentTab.value) return undefined
-  for (let i = currentSession.value.chatHistory.length - 1; i >= 0; i--) {
-    const message = currentSession.value.chatHistory[i]
-    if (message.role === 'agent' && message.agentName === activeAgentTab.value) {
-      return message
-    }
-  }
-  return undefined
+const activeTabIsBinaryQuestion = computed(() => {
+  if (!activeTabQuestion.value) return false
+  return isBinaryFreeTextQuestion(activeTabQuestion.value)
 })
-
-const showAnsweredForActiveTab = computed(() => {
-  const message = activeTabLatestAgentMessage.value
-  if (!message) return false
-  return showAnsweredForMessage(message)
-})
-
-const showCompletedForActiveTab = computed(() => {
-  const message = activeTabLatestAgentMessage.value
-  if (!message) return false
-  return showCompletedForMessage(message)
-})
-
-function showAnsweredForMessage(message: { role: string; messageId?: string; agentName?: string }): boolean {
-  if (message.role !== 'agent' || !message.messageId || !message.agentName) return false
-  const hasPending = latestPendingQuestionByAgent.value.has(message.agentName)
-  if (hasPending) return false
-  if (!lastAnsweredQuestionIdByAgent.value[message.agentName]) return false
-  return latestAgentMessageIdByAgent.value.get(message.agentName) === message.messageId
-}
-
-function showCompletedForMessage(message: { role: string; messageId?: string; agentName?: string }): boolean {
-  if (message.role !== 'agent' || !message.messageId || !message.agentName) return false
-  const latestMessageId = latestAgentMessageIdByAgent.value.get(message.agentName)
-  if (latestMessageId !== message.messageId) return false
-  if (latestPendingQuestionByAgent.value.has(message.agentName)) return false
-  const agentNode = agents.find(a => a.name === message.agentName)
-  return agentNode?.status === 'complete' || agentNode?.status === 'winner'
-}
 
 function agentTabState(agentName: string): 'awaiting' | 'ready' | 'running' | 'failed' | 'idle' {
   if (latestPendingQuestionByAgent.value.has(agentName)) return 'awaiting'
@@ -255,7 +222,6 @@ async function handleSubmit() {
   historyIndex = -1
 
   promptInput.value = ''
-  lastAnsweredQuestionIdByAgent.value = {}
   resetState()
   await submitPrompt(prompt)
 }
@@ -268,7 +234,6 @@ async function handleDecision(d: 'accept' | 'decline' | 'restart') {
     questionAnswerTextById.value = {}
     questionChoiceById.value = {}
     questionChoicesById.value = {}
-    lastAnsweredQuestionIdByAgent.value = {}
   }
 }
 
@@ -306,13 +271,6 @@ async function handleSubmitQuestionAnswer(question: UserQuestion) {
       selectedChoices,
     )
     if (submitted) {
-      const agentName = getQuestionAgentName(question)
-      if (agentName) {
-        lastAnsweredQuestionIdByAgent.value = {
-          ...lastAnsweredQuestionIdByAgent.value,
-          [agentName]: question.questionId,
-        }
-      }
       clearQuestionDraftState(question.questionId)
     }
   } finally {
@@ -327,8 +285,14 @@ async function submitActiveTabQuestion() {
   await handleSubmitQuestionAnswer(activeTabQuestion.value)
 }
 
+async function submitBinaryChoice(question: UserQuestion, choice: 'Yes' | 'No') {
+  if (isQuestionSubmitting(question.questionId)) return
+  setQuestionAnswerText(question.questionId, choice)
+  await handleSubmitQuestionAnswer(question)
+}
+
 function handleActiveTabQuestionKeydown(e: KeyboardEvent) {
-  if (!activeTabQuestion.value || activeTabQuestion.value.inputType !== 'FreeText') return
+  if (!activeTabQuestion.value || activeTabQuestion.value.inputType !== 'FreeText' || activeTabIsBinaryQuestion.value) return
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     submitActiveTabQuestion()
@@ -505,25 +469,12 @@ onMounted(() => {
         <!-- Chat Messages -->
         <template v-if="currentSession">
           <template v-for="(msg, i) in activeAgentMessages" :key="`${msg.messageId || i}-${activeAgentTab}`">
-            <ChatBubble
-              v-if="msg.role !== 'question' && msg.role !== 'answer'"
-              :message="msg"
-            />
+            <ChatBubble :message="msg" />
           </template>
-
-          <ChatBubble
-            v-if="activeTabQuestion"
-            :message="{
-              role: 'question',
-              content: activeTabQuestion.prompt,
-              agentName: activeTabQuestion.sourceName || activeTabQuestion.source,
-              timestamp: activeTabQuestion.timestamp,
-            }"
-          />
 
           <div v-if="activeTabQuestion" class="agent-question-composer">
             <div class="composer-header">
-              <span class="question-type">{{ activeTabQuestion.inputType }}</span>
+              <span class="question-type">{{ questionInputLabel(activeTabQuestion) }}</span>
             </div>
 
             <div v-if="activeTabQuestion.inputType !== 'FreeText'" class="question-choices">
@@ -545,8 +496,18 @@ onMounted(() => {
               >{{ choice }}</button>
             </div>
 
+            <div v-else-if="activeTabIsBinaryQuestion" class="question-choices">
+              <button
+                v-for="choice in ['Yes', 'No']"
+                :key="choice"
+                :class="['choice-chip', { selected: questionAnswerTextById[activeTabQuestion.questionId] === choice }]"
+                :disabled="isQuestionSubmitting(activeTabQuestion.questionId)"
+                @click="submitBinaryChoice(activeTabQuestion, choice as 'Yes' | 'No')"
+              >{{ choice }}</button>
+            </div>
+
             <InputText
-              v-if="activeTabQuestion.inputType === 'FreeText'"
+              v-else
               :modelValue="questionAnswerTextById[activeTabQuestion.questionId] ?? ''"
               @update:modelValue="setQuestionAnswerText(activeTabQuestion.questionId, String($event ?? ''))"
               class="question-composer-input"
@@ -555,7 +516,7 @@ onMounted(() => {
               @keydown="handleActiveTabQuestionKeydown"
             />
 
-            <div class="composer-actions">
+            <div v-if="!activeTabIsBinaryQuestion" class="composer-actions">
               <Button
                 icon="pi pi-send"
                 :label="isQuestionSubmitting(activeTabQuestion.questionId) ? 'Sending...' : 'Send'"
@@ -568,15 +529,6 @@ onMounted(() => {
             </div>
           </div>
 
-          <div v-if="!activeTabQuestion && showAnsweredForActiveTab" class="clarification-answered-card">
-            <i class="pi pi-check-circle"></i>
-            <span>Answer submitted. Waiting for next question.</span>
-          </div>
-
-          <div v-else-if="!activeTabQuestion && showCompletedForActiveTab" class="agent-completed-card">
-            <i class="pi pi-verified"></i>
-            <span>{{ activeAgentTab }} complete.</span>
-          </div>
         </template>
 
         <!-- Error -->
@@ -1592,27 +1544,5 @@ onMounted(() => {
 .composer-actions {
   display: flex;
   justify-content: flex-end;
-}
-.clarification-answered-card {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  color: var(--accent-green);
-  font-size: 0.82rem;
-  border: 1px solid rgba(16,185,129,0.3);
-  background: rgba(16,185,129,0.08);
-  border-radius: 10px;
-  padding: 0.65rem 0.8rem;
-}
-.agent-completed-card {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  color: var(--accent-blue);
-  font-size: 0.82rem;
-  border: 1px solid rgba(59,130,246,0.28);
-  background: rgba(59,130,246,0.08);
-  border-radius: 10px;
-  padding: 0.65rem 0.8rem;
 }
 </style>
